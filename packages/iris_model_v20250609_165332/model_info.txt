@@ -1,0 +1,7 @@
+Model Information
+================
+Model Type: Random Forest Classifier
+Training Date: 2025-06-09 16:53:32
+Features: 4
+Classes: 3
+Package Version: 20250609_165332
