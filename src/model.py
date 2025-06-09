@@ -18,6 +18,9 @@ class IrisModel:
             n_samples=1000,
             n_features=4,
             n_classes=3,
+            n_informative=3,  # Fixed: increased from 2 to 3
+            n_redundant=1,  # Added: to make total features = 4
+            n_clusters_per_class=1,  # Fixed: reduced from 2 to 1
             random_state=42
         )
         return X, y
@@ -49,7 +52,6 @@ class IrisModel:
         dir_path = os.path.dirname(filepath)
         if dir_path:  # Only create if there's actually a directory path
             os.makedirs(dir_path, exist_ok=True)
-
         joblib.dump(self.model, filepath)
         return filepath
 
