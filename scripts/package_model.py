@@ -11,7 +11,7 @@ def package_model():
     # Check if model exists
     model_path = "models/trained_model.pkl"
     if not os.path.exists(model_path):
-        print("✗ Error: Trained model not found. Run training first.")
+        print("[ERROR] Trained model not found. Run training first.")
         return 1
 
     # Create package directory
@@ -65,7 +65,7 @@ print(f"Prediction: {prediction[0]}")
                 arcname = os.path.relpath(file_path, package_dir)
                 zipf.write(file_path, arcname)
 
-    print(f"✓ Model packaged successfully: {zip_path}")
+    print(f"[SUCCESS] Model packaged successfully: {zip_path}")
     print(f"Package size: {os.path.getsize(zip_path)} bytes")
 
     return 0

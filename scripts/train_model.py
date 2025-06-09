@@ -25,10 +25,10 @@ def main():
     print(f"Model saved to: {model_path}")
 
     if accuracy > 0.8:
-        print("✓ Training completed successfully - Model meets accuracy threshold")
+        print("[SUCCESS] Training completed successfully - Model meets accuracy threshold")
         return 0
     else:
-        print("✗ Training failed - Model accuracy below threshold")
+        print("[FAILED] Training failed - Model accuracy below threshold")
         return 1
 
 
