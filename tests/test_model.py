@@ -54,7 +54,7 @@ class TestIrisModel:
         """Test model saving and loading"""
         # Train and save model
         self.model.train(self.X, self.y)
-        model_path = self.model.save_model("test_model.pkl")
+        model_path = self.model.save_model("models/trained_model.pkl")
 
         # Create new model instance and load
         new_model = IrisModel()

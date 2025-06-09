@@ -17,10 +17,7 @@ class IrisModel:
         X, y = make_classification(
             n_samples=1000,
             n_features=4,
-            n_informative=4,  # Fixed: Set n_informative to 4 to support 3 classes
-            n_redundant=0,  # Fixed: Set redundant features to 0
             n_classes=3,
-            n_clusters_per_class=1,  # Fixed: Reduced clusters per class
             random_state=42
         )
         return X, y
@@ -48,7 +45,11 @@ class IrisModel:
 
     def save_model(self, filepath="models/trained_model.pkl"):
         """Save trained model"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Only create directory if filepath contains a directory
+        dir_path = os.path.dirname(filepath)
+        if dir_path:  # Only create if there's actually a directory path
+            os.makedirs(dir_path, exist_ok=True)
+
         joblib.dump(self.model, filepath)
         return filepath
 
