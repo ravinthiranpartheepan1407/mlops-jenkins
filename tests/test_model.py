@@ -58,12 +58,12 @@ class TestIrisModel:
 
         # Create new model instance and load
         new_model = IrisModel()
-        new_model.load_model("trained_model.pkl")
+        new_model.load_model("models/trained_model.pkl")
 
         # Test loaded model works
         predictions = new_model.predict(self.X[:5])
         assert len(predictions) == 5
 
         # Cleanup
-        if os.path.exists("trained_model.pkl"):
-            os.remove("trained_model.pkl")
+        if os.path.exists("models/trained_model.pkl"):
+            os.remove("models/trained_model.pkl")
