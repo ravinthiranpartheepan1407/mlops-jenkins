@@ -1,0 +1,236 @@
+"""
+Social Media Automation API - FastAPI Backend
+Handles Facebook OAuth, post scheduling, and automation
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from typing import Optional
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+import httpx
+import os
+import uuid
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="Social Media Automation API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+FB_APP_ID     = ""
+FB_APP_SECRET = ""
+FB_REDIRECT   = "http://localhost:8000/auth/facebook/callback"
+FRONTEND_URL  = "https://soflow-one.vercel.app"
+
+users_store: dict = {}
+posts_store: list = []
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+
+class PostCreate(BaseModel):
+    message: str
+    page_id: str
+    session_token: str
+    scheduled_time: Optional[str] = None
+    post_type: str = "post"
+    image_url: Optional[str] = None
+
+
+async def fb_get(path: str, token: str, params: dict = {}):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"https://graph.facebook.com/v19.0/{path}",
+            params={"access_token": token, **params}
+        )
+        return r.json()
+
+
+async def fb_post_req(path: str, token: str, data: dict = {}):
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"https://graph.facebook.com/v19.0/{path}",
+            data={"access_token": token, **data}
+        )
+        return r.json()
+
+
+@app.get("/auth/facebook")
+def facebook_login():
+    scopes = "pages_manage_posts,pages_read_engagement,pages_show_list"
+    url = (
+        f"https://www.facebook.com/v19.0/dialog/oauth"
+        f"?client_id={FB_APP_ID}"
+        f"&redirect_uri={FB_REDIRECT}"
+        f"&scope={scopes}"
+        f"&response_type=code"
+    )
+    return RedirectResponse(url)
+
+
+@app.get("/auth/facebook/callback")
+async def facebook_callback(code: str):
+    async with httpx.AsyncClient() as client:
+        token_res = await client.get(
+            "https://graph.facebook.com/v19.0/oauth/access_token",
+            params={
+                "client_id": FB_APP_ID,
+                "client_secret": FB_APP_SECRET,
+                "redirect_uri": FB_REDIRECT,
+                "code": code,
+            }
+        )
+        token_data = token_res.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(400, "Failed to get access token")
+
+        profile = await fb_get("me", access_token, {"fields": "id,name,email,picture"})
+        pages_data = await fb_get("me/accounts", access_token)
+        pages = pages_data.get("data", [])
+
+        session_token = str(uuid.uuid4())
+        users_store[session_token] = {
+            "user": profile,
+            "access_token": access_token,
+            "pages": pages,
+            "connected_at": datetime.utcnow().isoformat(),
+        }
+
+    return RedirectResponse(
+        f"{FRONTEND_URL}/dashboard?session={session_token}&name={profile.get('name', '')}"
+    )
+
+
+@app.get("/auth/me")
+def get_me(session_token: str):
+    user_data = users_store.get(session_token)
+    if not user_data:
+        raise HTTPException(401, "Invalid or expired session")
+    return {
+        "user": user_data["user"],
+        "pages": user_data["pages"],
+        "connected_at": user_data["connected_at"],
+    }
+
+
+@app.post("/auth/logout")
+def logout(session_token: str):
+    users_store.pop(session_token, None)
+    return {"message": "Logged out"}
+
+
+async def _publish_fb(page_token, page_id, message, post_type, image_url):
+    if post_type == "story" and image_url:
+        return await fb_post_req(f"{page_id}/photos", page_token, {
+            "url": image_url, "caption": message,
+        })
+    data = {"message": message}
+    if image_url:
+        data["link"] = image_url
+    return await fb_post_req(f"{page_id}/feed", page_token, data)
+
+
+def sync_publish(post_id, message, page_id, page_token, post_type, image_url):
+    import asyncio
+    loop = asyncio.new_event_loop()
+    result = loop.run_until_complete(
+        _publish_fb(page_token, page_id, message, post_type, image_url)
+    )
+    loop.close()
+    for post in posts_store:
+        if post["id"] == post_id:
+            post["status"] = "published" if "id" in result else "failed"
+            post["fb_post_id"] = result.get("id")
+
+
+@app.post("/posts/publish")
+async def publish_post(payload: PostCreate):
+    user_data = users_store.get(payload.session_token)
+    if not user_data:
+        raise HTTPException(401, "Invalid session")
+
+    page = next((p for p in user_data["pages"] if p["id"] == payload.page_id), None)
+    if not page:
+        raise HTTPException(404, "Page not found")
+
+    page_token = page["access_token"]
+    post_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    if payload.scheduled_time:
+        scheduled_dt = datetime.fromisoformat(payload.scheduled_time.replace("Z",""))
+        record = {
+            "id": post_id,
+            "message": payload.message,
+            "page_id": payload.page_id,
+            "page_name": page.get("name", ""),
+            "status": "scheduled",
+            "created_at": now,
+            "scheduled_time": payload.scheduled_time,
+            "post_type": payload.post_type,
+            "image_url": payload.image_url,
+            "fb_post_id": None,
+        }
+        posts_store.append(record)
+        scheduler.add_job(
+            sync_publish, "date", run_date=scheduled_dt,
+            args=[post_id, payload.message, payload.page_id, page_token,
+                  payload.post_type, payload.image_url],
+            id=post_id,
+        )
+        return record
+
+    fb_result = await _publish_fb(
+        page_token, payload.page_id, payload.message,
+        payload.post_type, payload.image_url
+    )
+    record = {
+        "id": post_id,
+        "message": payload.message,
+        "page_id": payload.page_id,
+        "page_name": page.get("name", ""),
+        "status": "published" if "id" in fb_result else "failed",
+        "created_at": now,
+        "scheduled_time": None,
+        "post_type": payload.post_type,
+        "image_url": payload.image_url,
+        "fb_post_id": fb_result.get("id"),
+    }
+    posts_store.append(record)
+    return record
+
+
+@app.get("/posts")
+def list_posts(session_token: str):
+    if session_token not in users_store:
+        raise HTTPException(401, "Invalid session")
+    return {"posts": posts_store}
+
+
+@app.delete("/posts/{post_id}")
+def delete_post(post_id: str, session_token: str):
+    global posts_store
+    if session_token not in users_store:
+        raise HTTPException(401, "Invalid session")
+    posts_store = [p for p in posts_store if p["id"] != post_id]
+    try:
+        scheduler.remove_job(post_id)
+    except Exception:
+        pass
+    return {"message": "Removed"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
