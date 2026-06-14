@@ -1,0 +1,476 @@
+"""
+main.py — FastAPI chatbot routes
+Covers:
+  • GET/PUT  /chatbot/config/{store_id}      — FAQ + bot identity config
+  • POST     /chatbot/chat                   — AI chat (FAQ RAG + Phi-4 fallback)
+  • POST     /chatbot/refund                 — Razorpay refund initiation
+  • POST     /chatbot/return                 — Product return + image defect check
+"""
+
+from __future__ import annotations
+import os, ssl, json, re, difflib, httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
+from typing import Optional, List
+import razorpay
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# ── Azure / Phi-4 config ──────────────────────────────────────────────────────
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference.models import UserMessage, SystemMessage
+from azure.core.credentials import AzureKeyCredential
+
+AZURE_API_URL = os.environ.get("API_URL")
+AZURE_API_KEY = os.environ.get("API_KEY")
+AZURE_MODEL   = "Phi-4"
+
+# ── Razorpay config ───────────────────────────────────────────────────────────
+RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="Store Chatbot API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(f"[422] Path: {request.url.path} | Body: {body.decode()} | Errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body_received": body.decode()},
+    )
+
+# ── In-memory store (replace with your DB layer) ──────────────────────────────
+chatbot_configs: dict = {}
+razorpay_keys: dict   = {}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Schemas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FAQ(BaseModel):
+    question: str
+    answer:   str
+
+class ChatbotConfig(BaseModel):
+    bot_name: str       = "Store Assistant"
+    greeting: str       = "Hi! How can I help you today?"
+    faqs:     List[FAQ] = []
+
+class ChatRequest(BaseModel):
+    store_id: Optional[str] = ""
+    message:  str
+
+    @field_validator("message")
+    @classmethod
+    def message_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("message cannot be empty")
+        return v.strip()
+
+class RefundRequest(BaseModel):
+    store_id: str
+    order_id: str
+    amount:   float
+    reason:   Optional[str] = "Customer requested refund"
+
+# REPLACE ReturnRequest:
+class ReturnRequest(BaseModel):
+    store_id:      str
+    order_id:      str
+    reason:        Optional[str] = ""
+    image_url:     Optional[str] = ""       # ✅ URL instead of base64
+    image_caption: Optional[str] = ""
+    image_base64:  Optional[str] = ""       # kept for backwards compat
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def allow_self_signed_https():
+    if not os.environ.get("PYTHONHTTPSVERIFY") and getattr(ssl, "_create_unverified_context", None):
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def get_phi4_client() -> Optional[ChatCompletionsClient]:
+    if not AZURE_API_URL or not AZURE_API_KEY:
+        print("[Phi-4] Missing API_URL or API_KEY environment variables.")
+        return None
+    try:
+        return ChatCompletionsClient(
+            endpoint=AZURE_API_URL,
+            credential=AzureKeyCredential(AZURE_API_KEY),
+        )
+    except Exception as e:
+        print(f"[Phi-4] Client init error: {e}")
+        return None
+
+
+def phi4_complete(prompt: str, system: str = "") -> str:
+    """Call Phi-4 via Azure AI Inference SDK."""
+    client = get_phi4_client()
+    if not client:
+        return "I'm having trouble connecting to my AI backend. Please try again later."
+    try:
+        msgs = []
+        if system:
+            msgs.append(SystemMessage(content=system))
+        msgs.append(UserMessage(content=prompt))
+        response = client.complete(
+            messages=msgs,
+            model=AZURE_MODEL,
+            max_tokens=512,
+            temperature=0.4,
+            top_p=1,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"AI error: {str(e)}"
+
+
+# ── Stopwords excluded from overlap scoring to avoid false FAQ matches ─────────
+STOPWORDS = {
+    "what", "is", "are", "the", "a", "an", "your", "my", "do", "does",
+    "how", "when", "where", "which", "who", "can", "i", "you", "we",
+    "it", "this", "that", "for", "of", "to", "in", "on", "at", "be",
+    "will", "have", "has", "about", "and", "or", "not", "no", "yes",
+    "me", "us", "them", "they", "he", "she", "its", "our", "their",
+    "from", "with", "by", "please", "tell", "get", "give", "want",
+}
+
+
+def faq_match(faqs: List[FAQ], question: str) -> Optional[str]:
+    """
+    Match a customer question to the closest FAQ entry.
+
+    Uses meaningful-word overlap (stopwords excluded) combined with
+    fuzzy sequence matching. Requires a combined score >= 0.5 to
+    avoid false positives from common words like 'what is your'.
+    """
+    if not faqs:
+        return None
+
+    q_lower  = question.lower()
+    q_words  = set(re.findall(r"\w+", q_lower)) - STOPWORDS
+
+    if not q_words:
+        return None
+
+    best_score  = 0.0
+    best_answer = None
+
+    for faq in faqs:
+        faq_lower = faq.question.lower()
+        faq_words = set(re.findall(r"\w+", faq_lower)) - STOPWORDS
+
+        if not faq_words:
+            continue
+
+        overlap_count = len(faq_words & q_words)
+        word_score    = overlap_count / max(len(faq_words), 1)
+
+        seq_score = difflib.SequenceMatcher(None, q_lower, faq_lower).ratio()
+
+        combined = seq_score * 0.3 + word_score * 0.7
+
+        if combined > best_score:
+            best_score  = combined
+            best_answer = faq.answer
+
+    return best_answer if best_score >= 0.5 else None
+
+
+def detect_defects(caption: str) -> dict:
+    """Classify caption for defect keywords."""
+    DEFECT_KEYWORDS = [
+        "damage", "damaged", "crack", "cracked", "broken", "defect", "defective",
+        "scratch", "scratched", "tear", "torn", "worn", "stain", "stained",
+        "missing", "dent", "dented", "fault", "faulty", "chip", "chipped",
+        "discolor", "discoloured", "rust", "rusted", "bend", "bent",
+    ]
+    caption_lower = caption.lower()
+    found = [kw for kw in DEFECT_KEYWORDS if kw in caption_lower]
+    return {
+        "defects_detected":    len(found) > 0,
+        "keywords_found":      found,
+        "eligible_for_return": len(found) > 0,
+    }
+
+
+def get_razorpay_client(store_id: str):
+    creds = razorpay_keys.get(store_id)
+    if creds:
+        return razorpay.Client(auth=(creds["key_id"], creds["key_secret"]))
+    if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+        return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chatbot Config Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/chatbot/config/{store_id}")
+async def get_chatbot_config(store_id: str):
+    """Return the chatbot configuration for a store."""
+    return chatbot_configs.get(store_id, {
+        "bot_name": "Store Assistant",
+        "greeting": "Hi! How can I help you today?",
+        "faqs":     [],
+    })
+
+
+@app.put("/chatbot/config/{store_id}")
+async def put_chatbot_config(store_id: str, config: ChatbotConfig):
+    """Save / overwrite chatbot configuration for a store."""
+    chatbot_configs[store_id] = config.model_dump()
+    return {"success": True, "message": "Chatbot configuration saved."}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chat Endpoint — FAQ RAG + Phi-4 fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/chatbot/chat")
+async def chatbot_chat(req: ChatRequest):
+    """
+    1. Try to match against store FAQ knowledge base (strict stopword-aware matching).
+    2. If no FAQ match, call Phi-4 with the full FAQ context so it can reason
+       over the knowledge base and give a helpful, grounded answer.
+    """
+    cfg  = chatbot_configs.get(req.store_id, {})
+    faqs: List[FAQ] = [FAQ(**f) for f in cfg.get("faqs", [])]
+
+    # ── Step 1: Direct FAQ match (fast path) ──────────────────────────────────
+    faq_answer = faq_match(faqs, req.message)
+    if faq_answer:
+        return {"reply": faq_answer, "source": "faq"}
+
+    # ── Step 2: Phi-4 with FAQ knowledge base as context ──────────────────────
+    faq_context = "\n".join(
+        f"Q: {f.question}\nA: {f.answer}" for f in faqs
+    ) if faqs else "No FAQ data available."
+
+    system_prompt = f"""You are {cfg.get('bot_name', 'Store Assistant')}, a helpful and friendly customer support chatbot for this store.
+
+You have access to the store's FAQ Knowledge Base below. Use it as your primary source of truth when answering customer questions.
+
+GUIDELINES:
+1. Read the FAQ Knowledge Base carefully. If the customer's question is covered — even partially or by implication — answer using that information. You may rephrase it naturally and concisely.
+2. If the FAQ contains related or adjacent information that helps answer the question, use it to give a helpful response.
+3. If the FAQ genuinely does not contain any relevant information, respond with: "I don't have specific information on that. Please contact our support team for further assistance."
+4. Do NOT invent store-specific details (prices, policies, products, timelines) that are not present in the FAQ.
+5. Keep responses short, clear, and friendly. No unnecessary filler or greetings.
+
+FAQ Knowledge Base:
+{faq_context}"""
+
+    reply = phi4_complete(req.message, system=system_prompt)
+    return {"reply": reply, "source": "ai"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Razorpay Refund Endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/chatbot/refund")
+async def initiate_refund(req: RefundRequest):
+    """
+    Initiate a Razorpay refund for a given payment ID.
+    Pass the Razorpay payment_id (pay_XXXX) in the order_id field.
+    If an order_id (order_XXXX) is passed, we look up the captured payment first.
+    Amount is in INR — converted to paise internally.
+    """
+    rzp = get_razorpay_client(req.store_id)
+    if not rzp:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay not configured for this store. Please add your API credentials in the Payments tab.",
+        )
+
+    payment_id = req.order_id.strip()
+
+    if not payment_id.startswith("pay_"):
+        if payment_id.startswith("order_"):
+            try:
+                payments = rzp.order.payments(payment_id)
+                items    = payments.get("items", [])
+                if not items:
+                    raise HTTPException(status_code=404, detail="No payments found for this order ID.")
+                captured = [p for p in items if p.get("status") == "captured"]
+                if not captured:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No captured payment found for this order. Refund cannot be processed.",
+                    )
+                payment_id = captured[0]["id"]
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Could not resolve order to payment: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid payment ID. Must start with 'pay_' or 'order_'.")
+
+    amount_paise = int(req.amount * 100)
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="Refund amount must be greater than 0.")
+
+    try:
+        refund = rzp.payment.refund(payment_id, {
+            "amount": amount_paise,
+            "speed":  "optimum",
+            "notes": {
+                "reason":   req.reason or "Customer requested refund",
+                "store_id": req.store_id,
+            },
+        })
+        return {
+            "success":    True,
+            "refund_id":  refund.get("id"),
+            "payment_id": refund.get("payment_id"),
+            "amount":     refund.get("amount", amount_paise) / 100,
+            "status":     refund.get("status"),
+            "speed":      refund.get("speed_processed"),
+            "message":    f"Refund of ₹{req.amount:.2f} initiated successfully.",
+        }
+    except razorpay.errors.BadRequestError as e:
+        raise HTTPException(status_code=400, detail=f"Razorpay error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refund failed: {str(e)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Product Return + Image Verification Endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MODELSLAB_KEY = os.environ.get("VID_KEY")
+
+
+async def get_caption_from_modelslab(image_url: str) -> Optional[str]:
+    if not MODELSLAB_KEY:
+        print("[ModelsLab] ❌ VID_KEY not set")
+        return None
+    if not image_url:
+        print("[ModelsLab] ❌ No image URL provided")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.post(
+                "https://modelslab.com/api/v6/image_editing/caption",
+                json={"init_image": image_url, "length": "short", "key": MODELSLAB_KEY},
+            )
+            data = res.json()
+            print(f"[ModelsLab] Raw response: {data}")
+
+            # output is a URL to a JSON file — fetch it
+            output = data.get("output")
+            if isinstance(output, list) and output:
+                json_url = output[0]
+                json_res = await client.get(json_url)
+                caption_data = json_res.json()
+                print(f"[ModelsLab] Caption JSON: {caption_data}")
+                if isinstance(caption_data, list) and caption_data:
+                    caption = caption_data[0].get("caption") or caption_data[0].get("output") or str(caption_data[0])
+                else:
+                    caption = caption_data.get("caption") or caption_data.get("output") or str(caption_data)
+                return caption
+            elif isinstance(output, str):
+                return output
+
+            return data.get("caption")
+    except Exception as e:
+        print(f"[ModelsLab] Error: {e}")
+        return None
+
+
+@app.post("/chatbot/return")
+async def submit_return(req: ReturnRequest):
+    caption = req.image_caption or ""
+    print(f"[Return] image_url: '{req.image_url}'")
+
+    if not caption and req.image_url:
+        caption = await get_caption_from_modelslab(req.image_url) or ""
+        print(f"[Return] caption after ModelsLab: '{caption}'")
+
+    defect_analysis = detect_defects(caption)
+    print(f"[Return] defect_analysis: {defect_analysis}")
+
+    if caption:
+        verdict_prompt = (
+            f"A customer wants to return a product from order {req.order_id}.\n"
+            f"Reason given: {req.reason or 'Not specified'}\n"
+            f"AI image analysis of the product photo: {caption}\n"
+            f"Defect keywords found: {', '.join(defect_analysis['keywords_found']) or 'none'}\n\n"
+            "Based on this, write a SHORT (2 sentences max) customer-facing message:\n"
+            "- If defects are present: confirm the return is approved and mention next steps.\n"
+            "- If no defects: inform the customer the item appears undamaged; flag for manual review.\n"
+            "Be empathetic and professional."
+        )
+        verdict_message = phi4_complete(verdict_prompt)
+    else:
+        verdict_message = (
+            "No visible damage or defects were found in your product photo. Your return request has been rejected."
+            if not defect_analysis["defects_detected"]
+            else "Defects detected in your product image. Your return request has been approved. Please await pickup instructions."
+        )
+
+    return {
+        "success":          True,
+        "order_id":         req.order_id,
+        "eligible":         defect_analysis["eligible_for_return"],
+        "defects_detected": defect_analysis["defects_detected"],
+        "defect_keywords":  defect_analysis["keywords_found"],
+        "image_caption":    caption,
+        "message":          verdict_message,
+        "status":           "approved" if defect_analysis["eligible_for_return"] else "manual_review",
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Razorpay per-store key management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RazorpayKeyPayload(BaseModel):
+    key_id:     str
+    key_secret: Optional[str] = ""
+
+
+@app.get("/razorpay/connection/{store_id}")
+async def get_razorpay_connection(store_id: str):
+    creds = razorpay_keys.get(store_id)
+    if creds:
+        return {"connected": True, "key_id": creds["key_id"]}
+    return {"connected": False}
+
+
+@app.put("/razorpay/connection/{store_id}")
+async def put_razorpay_connection(store_id: str, payload: RazorpayKeyPayload):
+    razorpay_keys[store_id] = {
+        "key_id":     payload.key_id,
+        "key_secret": payload.key_secret or RAZORPAY_KEY_SECRET,
+    }
+    return {"success": True, "key_id": payload.key_id}
+
+
+@app.delete("/razorpay/connection/{store_id}")
+async def delete_razorpay_connection(store_id: str):
+    razorpay_keys.pop(store_id, None)
+    return {"success": True}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dev entrypoint
+# ═══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import uvicorn
+    allow_self_signed_https()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
