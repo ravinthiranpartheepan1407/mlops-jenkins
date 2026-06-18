@@ -126,8 +126,8 @@ AZURE_API_KEY = os.environ.get("API_KEY")
 AZURE_MODEL   = "Phi-4"
 
 # ── Razorpay config ───────────────────────────────────────────────────────────
-RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID")
+# RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 users_store: dict = {}
 posts_store: list = []
@@ -3011,7 +3011,7 @@ class RefundRequest(BaseModel):
     amount:   float
     reason:   Optional[str] = "Customer requested refund"
 
-# REPLACE ReturnRequest:
+# REPLACE ReturnRequests:
 class ReturnRequest(BaseModel):
     store_id:      str
     order_id:      str
@@ -3136,13 +3136,13 @@ def detect_defects(caption: str) -> dict:
     }
 
 
-def get_razorpay_client(store_id: str):
-    creds = razorpay_keys.get(store_id)
-    if creds:
-        return razorpay.Client(auth=(creds["key_id"], creds["key_secret"]))
-    if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
-        return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-    return None
+# def get_razorpay_client(store_id: str):
+#     creds = razorpay_keys.get(store_id)
+#     if creds:
+#         return razorpay.Client(auth=(creds["key_id"], creds["key_secret"]))
+#     if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+#         return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+#     return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Chatbot Config Endpoints
@@ -3210,70 +3210,70 @@ FAQ Knowledge Base:
 # Razorpay Refund Endpoint
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/chatbot/refund")
-async def initiate_refund(req: RefundRequest):
-    """
-    Initiate a Razorpay refund for a given payment ID.
-    Pass the Razorpay payment_id (pay_XXXX) in the order_id field.
-    If an order_id (order_XXXX) is passed, we look up the captured payment first.
-    Amount is in INR — converted to paise internally.
-    """
-    rzp = get_razorpay_client(req.store_id)
-    if not rzp:
-        raise HTTPException(
-            status_code=503,
-            detail="Razorpay not configured for this store. Please add your API credentials in the Payments tab.",
-        )
-
-    payment_id = req.order_id.strip()
-
-    if not payment_id.startswith("pay_"):
-        if payment_id.startswith("order_"):
-            try:
-                payments = rzp.order.payments(payment_id)
-                items    = payments.get("items", [])
-                if not items:
-                    raise HTTPException(status_code=404, detail="No payments found for this order ID.")
-                captured = [p for p in items if p.get("status") == "captured"]
-                if not captured:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="No captured payment found for this order. Refund cannot be processed.",
-                    )
-                payment_id = captured[0]["id"]
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Could not resolve order to payment: {str(e)}")
-        else:
-            raise HTTPException(status_code=400, detail="Invalid payment ID. Must start with 'pay_' or 'order_'.")
-
-    amount_paise = int(req.amount * 100)
-    if amount_paise <= 0:
-        raise HTTPException(status_code=400, detail="Refund amount must be greater than 0.")
-
-    try:
-        refund = rzp.payment.refund(payment_id, {
-            "amount": amount_paise,
-            "speed":  "optimum",
-            "notes": {
-                "reason":   req.reason or "Customer requested refund",
-                "store_id": req.store_id,
-            },
-        })
-        return {
-            "success":    True,
-            "refund_id":  refund.get("id"),
-            "payment_id": refund.get("payment_id"),
-            "amount":     refund.get("amount", amount_paise) / 100,
-            "status":     refund.get("status"),
-            "speed":      refund.get("speed_processed"),
-            "message":    f"Refund of ₹{req.amount:.2f} initiated successfully.",
-        }
-    except razorpay.errors.BadRequestError as e:
-        raise HTTPException(status_code=400, detail=f"Razorpay error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Refund failed: {str(e)}")
+# @app.post("/chatbot/refund")
+# async def initiate_refund(req: RefundRequest):
+#     """
+#     Initiate a Razorpay refund for a given payment ID.
+#     Pass the Razorpay payment_id (pay_XXXX) in the order_id field.
+#     If an order_id (order_XXXX) is passed, we look up the captured payment first.
+#     Amount is in INR — converted to paise internally.
+#     """
+#     rzp = get_razorpay_client(req.store_id)
+#     if not rzp:
+#         raise HTTPException(
+#             status_code=503,
+#             detail="Razorpay not configured for this store. Please add your API credentials in the Payments tab.",
+#         )
+#
+#     payment_id = req.order_id.strip()
+#
+#     if not payment_id.startswith("pay_"):
+#         if payment_id.startswith("order_"):
+#             try:
+#                 payments = rzp.order.payments(payment_id)
+#                 items    = payments.get("items", [])
+#                 if not items:
+#                     raise HTTPException(status_code=404, detail="No payments found for this order ID.")
+#                 captured = [p for p in items if p.get("status") == "captured"]
+#                 if not captured:
+#                     raise HTTPException(
+#                         status_code=400,
+#                         detail="No captured payment found for this order. Refund cannot be processed.",
+#                     )
+#                 payment_id = captured[0]["id"]
+#             except HTTPException:
+#                 raise HTTPException(status_code=400, detail="Invalid payment ID. Must start with 'pay_' or 'order_'.")
+#             except Exception as e:
+#                 raise HTTPException(status_code=400, detail=f"Could not resolve order to payment: {str(e)}")
+#         else:
+#             raise HTTPException(status_code=400, detail="Invalid payment ID. Must start with 'pay_' or 'order_'.")
+#
+#     amount_paise = int(req.amount * 100)
+#     if amount_paise <= 0:
+#         raise HTTPException(status_code=400, detail="Refund amount must be greater than 0.")
+#
+#     try:
+#         refund = rzp.payment.refund(payment_id, {
+#             "amount": amount_paise,
+#             "speed":  "optimum",
+#             "notes": {
+#                 "reason":   req.reason or "Customer requested refund",
+#                 "store_id": req.store_id,
+#             },
+#         })
+#         return {
+#             "success":    True,
+#             "refund_id":  refund.get("id"),
+#             "payment_id": refund.get("payment_id"),
+#             "amount":     refund.get("amount", amount_paise) / 100,
+#             "status":     refund.get("status"),
+#             "speed":      refund.get("speed_processed"),
+#             "message":    f"Refund of ₹{req.amount:.2f} initiated successfully.",
+#         }
+#     except razorpay.errors.BadRequestError as e:
+#         raise HTTPException(status_code=400, detail=f"Razorpay error: {str(e)}")
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Refund failed: {str(e)}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Product Return + Image Verification Endpoint
@@ -3319,6 +3319,40 @@ async def get_caption_from_modelslab(image_url: str) -> Optional[str]:
         return None
 
 
+
+def _resolve_order(store_id: str, raw_order_id: str):
+    """
+    Customer may type: internal UUID (92ce16db), Razorpay payment ID (pay_xxx),
+    or a partial/wrong string. Try all resolution strategies.
+    """
+    raw = raw_order_id.strip()
+
+    # 1. Direct key match
+    o = orders.get(raw)
+    if o and o.get("store_id") == store_id:
+        return o
+
+    # 2. Match by razorpay_payment_id
+    o = next((v for v in orders.values()
+              if v.get("store_id") == store_id
+              and v.get("razorpay_payment_id") == raw), None)
+    if o:
+        return o
+
+    # 3. Match by id field (in case key differs)
+    o = next((v for v in orders.values()
+              if v.get("store_id") == store_id
+              and v.get("id") == raw), None)
+    if o:
+        return o
+
+    # 4. Case-insensitive partial match on id
+    o = next((v for v in orders.values()
+              if v.get("store_id") == store_id
+              and raw.lower() in v.get("id", "").lower()), None)
+    return o
+
+
 @app.post("/chatbot/return")
 async def submit_return(req: ReturnRequest):
     caption = req.image_caption or ""
@@ -3350,14 +3384,21 @@ async def submit_return(req: ReturnRequest):
             else "Defects detected in your product image. Your return request has been approved. Please await pickup instructions."
         )
 
+    # Resolve actual order
+    resolved_order = _resolve_order(req.store_id, req.order_id)
+    actual_order_id = resolved_order["id"] if resolved_order else req.order_id
+    razorpay_payment_id = resolved_order.get("razorpay_payment_id", "") if resolved_order else ""
+
     # ── Persist the complaint so admin can view it ─────────────────────────────
     import time
     complaint = {
         "store_id":         req.store_id,
-        "order_id":         req.order_id,
         "reason":           req.reason or "",
         "image_url":        req.image_url or "",
         "image_caption":    caption,
+        "order_id":         actual_order_id,  # ← real internal UUID, not what customer typed
+        "razorpay_payment_id": razorpay_payment_id,
+        "customer_typed_order_id": req.order_id,  # ← preserve what they typed for reference
         "defects_detected": defect_analysis["defects_detected"],
         "defect_keywords":  defect_analysis["keywords_found"],
         "eligible":         defect_analysis["eligible_for_return"],
@@ -3365,6 +3406,7 @@ async def submit_return(req: ReturnRequest):
         "verdict_message":  verdict_message,
         "submitted_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
     return_complaints.setdefault(req.store_id, []).append(complaint)
 
     return {
@@ -3405,13 +3447,13 @@ async def get_razorpay_connection(store_id: str):
     return {"connected": False}
 
 
-@app.put("/razorpay/connection/{store_id}")
-async def put_razorpay_connection(store_id: str, payload: RazorpayKeyPayload):
-    razorpay_keys[store_id] = {
-        "key_id":     payload.key_id,
-        "key_secret": payload.key_secret or RAZORPAY_KEY_SECRET,
-    }
-    return {"success": True, "key_id": payload.key_id}
+# @app.put("/razorpay/connection/{store_id}")
+# async def put_razorpay_connection(store_id: str, payload: RazorpayKeyPayload):
+#     razorpay_keys[store_id] = {
+#         "key_id":     payload.key_id,
+#         "key_secret": payload.key_secret or RAZORPAY_KEY_SECRET,
+#     }
+#     return {"success": True, "key_id": payload.key_id}
 
 
 @app.delete("/razorpay/connection/{store_id}")
@@ -4092,6 +4134,82 @@ async def shiprocket_webhook(request: dict):
             break
 
     return {"received": True}
+
+
+# ─── Razorpay Refund ──────────────────────────────────────────────
+import hmac, hashlib, base64
+
+class RazorpayRefundRequest(BaseModel):
+    order_id: str
+    payment_id: Optional[str] = None  # if provided, skips order lookup for auth
+
+
+# @app.post("/razorpay/refund/{store_id}")
+# async def razorpay_refund(store_id: str, req: RazorpayRefundRequest):
+#     conn = razorpay_connections.get(store_id)
+#     if not conn:
+#         raise HTTPException(status_code=400, detail="Razorpay not connected for this store")
+#
+#     # Resolve order using the same helper
+#     order = _resolve_order(store_id, req.order_id)
+#     if not order:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=(
+#                 f"Order '{req.order_id}' not found for this store. "
+#                 "Use the 8-character Order ID shown in the Orders tab (e.g. 92ce16db), "
+#                 "or the Razorpay Payment ID (pay_xxx)."
+#             )
+#         )
+#
+#     payment_id = req.payment_id or order.get("razorpay_payment_id")
+#     if not payment_id:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="No Razorpay payment ID linked to this order. Was it paid via Razorpay?"
+#         )
+#
+#     if order.get("refund_status") == "refunded":
+#         raise HTTPException(status_code=400, detail="This order has already been refunded.")
+#
+#     key_secret = os.getenv("RAZORPAY_KEY_SECRET", "")
+#     if not key_secret:
+#         raise HTTPException(status_code=400, detail="RAZORPAY_KEY_SECRET missing from server .env")
+#
+#     credentials = base64.b64encode(f"{conn['key_id']}:{key_secret}".encode()).decode()
+#     amount_paise = int(round(order["total"] * 100))
+#
+#     try:
+#         async with httpx.AsyncClient(timeout=20) as client:
+#             res = await client.post(
+#                 f"https://api.razorpay.com/v1/payments/{payment_id}/refund",
+#                 headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/json"},
+#                 json={
+#                     "amount": amount_paise,
+#                     "notes": {"order_id": order["id"], "store_id": store_id, "reason": "Customer return approved"},
+#                 },
+#             )
+#             data = res.json()
+#     except httpx.RequestError as e:
+#         raise HTTPException(status_code=502, detail=f"Razorpay unreachable: {e}")
+#
+#     if res.status_code not in (200, 201):
+#         msg = data.get("error", {}).get("description") or f"Razorpay error {res.status_code}"
+#         raise HTTPException(status_code=400, detail=msg)
+#
+#     orders[order["id"]]["refund_status"] = "refunded"
+#     orders[order["id"]]["razorpay_refund_id"] = data.get("id", "")
+#     orders[order["id"]]["refunded_at"] = datetime.now().isoformat()
+#
+#     return {
+#         "success": True,
+#         "refund_id": data.get("id"),
+#         "amount": order["total"],
+#         "payment_id": payment_id,
+#         "internal_order_id": order["id"],
+#         "status": data.get("status"),
+#     }
+
 
 
 if __name__ == "__main__":
