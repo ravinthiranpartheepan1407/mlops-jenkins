@@ -29,29 +29,64 @@ In Meta App dashboard:
     {BACKEND_URL}/api/auth/whatsapp/callback
 """
 
+from __future__ import annotations
+
+# ── Standard Library ──────────────────────────────────────────────────────────
 import os
+import io
+import re
+import ssl
 import json
-import base64
 import uuid
-import httpx
+import base64
+import random
+import string
+import pathlib
+import platform
+import smtplib
+import difflib
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from typing import Optional, List, Dict, Any
-from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+# ── Third-Party: Web Framework ────────────────────────────────────────────────
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, field_validator
 
-from apscheduler.schedulers.background import BackgroundScheduler
+# ── Third-Party: HTTP Clients ─────────────────────────────────────────────────
+import httpx
+import requests
+from bs4 import BeautifulSoup
 
+# ── Third-Party: Auth & Security ──────────────────────────────────────────────
+from jose import JWTError, jwt
+
+# ── Third-Party: Google ───────────────────────────────────────────────────────
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 import google.auth.transport.requests
-import requests as pyrequests
+from fastapi.exceptions import RequestValidationError
 
-from jose import JWTError, jwt
+# ── Third-Party: Scheduler ────────────────────────────────────────────────────
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# ── Third-Party: Payments ─────────────────────────────────────────────────────
+import razorpay
+
+# ── Third-Party: ML / Vision ──────────────────────────────────────────────────
+from fastai.vision.all import PILImage
+
+# ── Third-Party: Azure / Phi-4 ───────────────────────────────────────────────
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference.models import UserMessage, SystemMessage
+from azure.core.credentials import AzureKeyCredential
+
+# ── Environment ───────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
 
 load_dotenv()
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = os.getenv("OAUTHLIB_INSECURE_TRANSPORT", "0")
@@ -61,7 +96,7 @@ app = FastAPI(title="SocialRamp API", version="4.0.0")
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:3000")],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,7 +109,7 @@ GOOGLE_CLIENT_ID             = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET         = os.getenv("GOOGLE_CLIENT_SECRET")
 WHATSAPP_PHONE_NUMBER_ID     = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID")
-FRONTEND_URL                 = os.getenv("FRONTEND_URL", "http://localhost:3000")
+FRONTEND_URL                 = "http://localhost:3000"
 SECRET_KEY                   = os.getenv("SECRET_KEY", "change-this-secret")
 BACKEND_URL                  = os.getenv("BACKEND_URL", "http://localhost:8000")
 WHATSAPP_VERIFY_TOKEN        = os.getenv("WHATSAPP_VERIFY_TOKEN", "socialramp_verify_token")
@@ -85,6 +120,14 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}
 FB_APP_ID     = os.getenv("FACEBOOK_APP_ID")
 FB_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET")
 FB_REDIRECT   = "http://localhost:8000/automation/auth/facebook/callback"
+
+AZURE_API_URL = os.environ.get("API_URL")
+AZURE_API_KEY = os.environ.get("API_KEY")
+AZURE_MODEL   = "Phi-4"
+
+# ── Razorpay config ───────────────────────────────────────────────────────────
+RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 
 users_store: dict = {}
 posts_store: list = []
@@ -97,11 +140,24 @@ oauth_state_store: Dict[str, str] = {}
 whatsapp_webhook_store: Dict[str, List] = {"messages": []}
 
 # ─── In-memory DB ────────────────────────────────────────────────
-stores = {}
+stores   = {}
 products = {}
-orders = {}
-reviewz = {}
-carts = {}
+orders   = {}
+reviews  = {}
+
+FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+# ─── Cashfree KYC credentials ────────────────────────────────────
+CASHFREE_CLIENT_ID     = os.getenv("CASHFREE_CLIENT_ID")
+CASHFREE_CLIENT_SECRET = os.getenv("CASHFREE_CLIENT_SECRET")
+CASHFREE_BASE_URL      = os.getenv("CASHFREE_BASE_URL", "https://api.cashfree.com/verification")
+
+# ─── SMTP settings (for OTP emails) ─────────────────────────────
+SMTP_HOST     = os.getenv("SMTP_HOST", "mail.privateemail.com")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("EMAIL_USER")
+SMTP_PASSWORD = os.getenv("EMAIL_PASSWORD")
+SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)
 
 
 # ─── JWT UTILS ────────────────────────────────────────────────────────────────
@@ -197,8 +253,7 @@ class StoreUpdate(BaseModel):
     hero_text: Optional[str] = None
     hero_subtitle: Optional[str] = None
     banner_color: Optional[str] = None
-    page_config: Optional[str] = None  # ← add this
-
+    page_config: Optional[str] = None
 
 class Product(BaseModel):
     store_id: str
@@ -208,8 +263,8 @@ class Product(BaseModel):
     stock: int = 0
     category: Optional[str] = ""
     image_url: Optional[str] = ""
-    images: Optional[List[str]] = []  # ← add this
-
+    images: Optional[List[str]] = []
+    hsn_code: Optional[str] = ""
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -218,7 +273,8 @@ class ProductUpdate(BaseModel):
     stock: Optional[int] = None
     category: Optional[str] = None
     image_url: Optional[str] = None
-    images: Optional[List[str]] = None  # ← add this
+    images: Optional[List[str]] = None
+    hsn_code: Optional[str] = None
 
 class OrderItem(BaseModel):
     product_id: str
@@ -237,10 +293,6 @@ class Review(BaseModel):
     customer_name: str
     rating: int
     comment: Optional[str] = ""
-
-class CartItem(BaseModel):
-    product_id: str
-    quantity: int
 
 
 # ─── AUTOMATION ──────────────────────────────────────────────────────────────────
@@ -307,7 +359,7 @@ async def facebook_callback(code: str):
         }
 
     return RedirectResponse(
-        f"{FRONTEND_URL}/dashboard?session={session_token}&name={profile.get('name', '')}"
+        f"{FRONTEND_URL}/dashboard/home?session={session_token}&name={profile.get('name', '')}"
     )
 
 
@@ -496,7 +548,7 @@ async def instagram_callback(code: str):
         }
 
     return RedirectResponse(
-        f"{FRONTEND_URL}/dashboard?session={session_token}&platform=instagram"
+        f"{FRONTEND_URL}/dashboard/home?session={session_token}&platform=instagram"
     )
 
 
@@ -699,7 +751,7 @@ def gmail_callback(code: str, state: str):
         "platform": "gmail",
     }
     return RedirectResponse(
-        f"{FRONTEND_URL}/dashboard?session={session_token}&platform=gmail"
+        f"{FRONTEND_URL}/dashboard/home?session={session_token}&platform=gmail"
     )
 
 
@@ -871,7 +923,7 @@ def youtube_callback(code: str, state: str):
         "platform": "youtube",
     }
     return RedirectResponse(
-        f"{FRONTEND_URL}/dashboard?session={session_token}&platform=youtube"
+        f"{FRONTEND_URL}/dashboard/home?session={session_token}&platform=youtube"
     )
 
 
@@ -2412,6 +2464,244 @@ async def debug_instagram(session_id: str = Depends(get_session_id)):
 
 
 # ─── Store Endpoints ─────────────────────────────────────────────
+# ─── KYC Models ──────────────────────────────────────────────────
+class GSTINRequest(BaseModel):
+    gstin: str                  # frontend sends lowercase "gstin"
+
+    model_config = {"extra": "allow"}   # ignore any extra fields silently
+
+class CINRequest(BaseModel):
+    cin: str
+    company_name: Optional[str] = ""
+
+    model_config = {"extra": "allow"}
+
+class SendOTPRequest(BaseModel):
+    email: str
+    otp: str
+
+    model_config = {"extra": "allow"}
+
+# ─── Validation error handler → readable JSON instead of raw 422 ──
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    errors = exc.errors()
+    detail = "; ".join(
+        f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}"
+        for e in errors
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": detail, "raw_errors": errors},
+    )
+
+# ═══════════════════════════════════════════════════════════════════
+#  KYC ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/kyc/gstin")
+async def verify_gstin(req: GSTINRequest):
+    gstin_val = req.gstin.strip().upper()
+
+    if len(gstin_val) != 15:
+        raise HTTPException(status_code=400, detail="GSTIN must be exactly 15 characters")
+
+    # Dev / mock mode
+    if not CASHFREE_CLIENT_ID or not CASHFREE_CLIENT_SECRET:
+        print(f"[DEV] Mock GSTIN lookup for: {gstin_val}")
+        return {"gstin": gstin_val, "business_name": "SAMPLE BUSINESS PVT LTD", "status": "VALID"}
+
+    # Live Cashfree call — correct headers per Cashfree docs
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.post(
+                f"{CASHFREE_BASE_URL}/gstin",
+                json={"GSTIN": gstin_val, "business_name": ""},
+                headers={
+                    "x-client-id": CASHFREE_CLIENT_ID,
+                    "x-client-secret": CASHFREE_CLIENT_SECRET,
+                    "x-api-version": "2023-08-01",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            data = res.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Cashfree unreachable: {str(e)}")
+
+    print(f"[Cashfree GSTIN] status={res.status_code} body={data}")
+
+    if res.status_code != 200:
+        msg = data.get("message") or data.get("error") or f"Cashfree error {res.status_code}"
+        raise HTTPException(status_code=400, detail=msg)
+
+    # Response shape varies — check all known nested locations
+    gstin_data = data.get("gstin_data") or data.get("data") or data
+    business_name = (
+        gstin_data.get("legal_name_of_business")
+        or gstin_data.get("business_name")
+        or gstin_data.get("legalNameOfBusiness")
+        or gstin_data.get("legal_name")
+        or gstin_data.get("trade_name")
+        or data.get("legal_name_of_business")
+        or data.get("business_name")
+        or ""
+    )
+
+    cf_status = str(gstin_data.get("status") or data.get("status") or "").upper()
+    if cf_status == "INVALID":
+        raise HTTPException(status_code=400, detail="GSTIN is invalid or not registered")
+
+    return {"gstin": gstin_val, "business_name": business_name, "status": "VALID"}
+
+
+def _decode_cloudflare_email(hex_string: str) -> str:
+    try:
+        xor_key = int(hex_string[:2], 16)
+        return "".join(
+            chr(int(hex_string[i:i+2], 16) ^ xor_key)
+            for i in range(2, len(hex_string), 2)
+        )
+    except Exception:
+        return ""
+
+
+def _scrape_cin(company_name: str, cin: str) -> dict:
+    formatted_name = (
+        company_name.strip().upper()
+        .replace(" ", "-").replace(".", "").replace(",", "")
+    )
+    clean_cin = cin.strip().upper()
+    url = f"https://www.zaubacorp.com/company/{formatted_name}/{clean_cin}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return {}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Decode Cloudflare-obfuscated email
+    email = ""
+    cf_tag = soup.find(class_="__cf_email__")
+    if cf_tag and cf_tag.get("data-cfemail"):
+        email = _decode_cloudflare_email(cf_tag["data-cfemail"])
+    else:
+        match = re.search(r'data-cfemail="([a-f0-9]+)"', resp.text)
+        if match:
+            email = _decode_cloudflare_email(match.group(1))
+
+    # Parse directors table
+    directors = []
+    for table in soup.find_all("table"):
+        txt = table.text
+        if "DIN" in txt and "Director Name" in txt and "Designation" in txt:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    name = cols[1].text.strip()
+                    if name and "Unlisted" not in name:
+                        directors.append(name)
+            break
+
+    # Detect mismatch: zaubacorp page title / h1 contains the real company name
+    page_company = ""
+    h1 = soup.find("h1")
+    if h1:
+        page_company = h1.text.strip()
+
+    return {
+        "email": email,
+        "directors": directors,
+        "page_company": page_company,
+    }
+
+
+@app.post("/kyc/cin")
+def verify_cin(req: CINRequest):
+    cin_val = req.cin.strip().upper()
+
+    # company_name is passed from the frontend (auto-filled from GSTIN business name)
+    company_name = getattr(req, "company_name", "").strip()
+
+    try:
+        data = _scrape_cin(company_name, cin_val)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach zaubacorp: {str(e)}")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="CIN not found or invalid.")
+
+    # If we got a page company name back, do a loose mismatch check
+    page_company = data.get("page_company", "")
+    if company_name and page_company:
+        def _norm(s):
+            return re.sub(r"[^a-z0-9]", "", s.lower())
+        # Accept if either name contains the other (handles abbreviations)
+        if _norm(company_name) not in _norm(page_company) and _norm(page_company) not in _norm(company_name):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Business Name and CIN do not match. CIN belongs to: {page_company}"
+            )
+
+    return {
+        "status": "VALID",
+        "cin": cin_val,
+        "company_name": page_company or company_name,
+        "cin_status": "ACTIVE",
+        "email": data.get("email", ""),
+        "directors": data.get("directors", []),
+    }
+
+
+@app.post("/kyc/send-otp")
+def send_otp_email(req: SendOTPRequest):
+    """
+    Sends OTP to the email via SMTP.
+    OTP validation is client-side via localStorage — no DB required.
+    Prints OTP to console in dev mode (no SMTP credentials).
+    """
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print(f"[DEV] OTP for {req.email}: {req.otp}")
+        return {"sent": True, "dev_mode": True}
+
+    try:
+        body = (
+            f"Hello,\n\n"
+            f"Your verification OTP for store creation is:\n\n"
+            f"  {req.otp}\n\n"
+            f"This code expires in 10 minutes. Do not share it with anyone.\n\n"
+            f"— E-Commerce Builder Team"
+        )
+        msg = MIMEText(body)
+        msg["Subject"] = "Your Store Verification OTP"
+        msg["From"] = SMTP_FROM
+        msg["To"] = req.email
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [req.email], msg.as_string())
+
+        return {"sent": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send OTP email: {str(e)}")
+
+
+# ─── Store Endpoints ─────────────────────────────────────────────
 @app.post("/stores")
 def create_store(store: Store):
     store_id = str(uuid.uuid4())[:8]
@@ -2494,7 +2784,7 @@ def delete_product(product_id: str):
     del products[product_id]
     return {"message": "Product deleted"}
 
-# ─── Order / Checkout Endpoints ───────────────────────────────────
+# ─── Order Endpoints ──────────────────────────────────────────────
 @app.post("/orders")
 def create_order(order: Order):
     if order.store_id not in stores:
@@ -2544,30 +2834,30 @@ def create_review(review: Review):
     if review.store_id not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
     review_id = str(uuid.uuid4())[:8]
-    reviewz[review_id] = {
+    reviews[review_id] = {
         "id": review_id,
         **review.dict(),
         "created_at": datetime.now().isoformat(),
     }
-    return reviewz[review_id]
+    return reviews[review_id]
 
 @app.get("/reviewz")
-def list_reviewz(store_id: Optional[str] = None):
-    all_reviewz = list(reviewz.values())
+def list_reviews(store_id: Optional[str] = None):
+    all_reviews = list(reviews.values())
     if store_id:
-        all_reviewz = [r for r in all_reviewz if r["store_id"] == store_id]
-    return all_reviewz
+        all_reviews = [r for r in all_reviews if r["store_id"] == store_id]
+    return all_reviews
 
 @app.get("/reviewz/stats/{store_id}")
 def review_stats(store_id: str):
-    store_reviewz = [r for r in reviewz.values() if r["store_id"] == store_id]
-    if not store_reviewz:
-        return {"average_rating": 0, "total_reviewz": 0, "rating_breakdown": {}}
-    avg = sum(r["rating"] for r in store_reviewz) / len(store_reviewz)
-    breakdown = {str(i): sum(1 for r in store_reviewz if r["rating"] == i) for i in range(1, 6)}
+    store_reviews = [r for r in reviews.values() if r["store_id"] == store_id]
+    if not store_reviews:
+        return {"average_rating": 0, "total_reviews": 0, "rating_breakdown": {}}
+    avg = sum(r["rating"] for r in store_reviews) / len(store_reviews)
+    breakdown = {str(i): sum(1 for r in store_reviews if r["rating"] == i) for i in range(1, 6)}
     return {
         "average_rating": round(avg, 2),
-        "total_reviewz": len(store_reviewz),
+        "total_reviews": len(store_reviews),
         "rating_breakdown": breakdown,
     }
 
@@ -2576,19 +2866,1232 @@ def review_stats(store_id: str):
 def get_analytics(store_id: str):
     if store_id not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
-    store_orders = [o for o in orders.values() if o["store_id"] == store_id]
+    store_orders   = [o for o in orders.values() if o["store_id"] == store_id]
     store_products = [p for p in products.values() if p["store_id"] == store_id]
-    store_reviewz = [r for r in reviewz.values() if r["store_id"] == store_id]
-    total_revenue = sum(o["total"] for o in store_orders)
-    avg_rating = (sum(r["rating"] for r in store_reviewz) / len(store_reviewz)) if store_reviewz else 0
+    store_reviews  = [r for r in reviews.values() if r["store_id"] == store_id]
+    total_revenue  = sum(o["total"] for o in store_orders)
+    avg_rating     = (sum(r["rating"] for r in store_reviews) / len(store_reviews)) if store_reviews else 0
     return {
         "total_orders": len(store_orders),
         "total_revenue": round(total_revenue, 2),
         "total_products": len(store_products),
-        "total_reviewz": len(store_reviewz),
+        "total_reviews": len(store_reviews),
         "average_rating": round(avg_rating, 2),
         "recent_orders": store_orders[-5:][::-1],
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RAZORPAY  ── Key storage + Order creation
+# ═══════════════════════════════════════════════════════════════════
+
+razorpay_connections = {}
+
+class RazorpayConnection(BaseModel):
+    key_id: str
+
+class RazorpayOrderRequest(BaseModel):
+    store_id: str
+    payment_id: str
+    customer_name: str
+    customer_email: str
+    customer_phone: Optional[str] = ""
+    address: Optional[str] = ""
+    items: List[OrderItem]
+
+@app.get("/razorpay/connection/{store_id}")
+def get_razorpay_connection(store_id: str):
+    conn = razorpay_connections.get(store_id)
+    if not conn:
+        return {"connected": False}
+    return {"connected": True, "key_id": conn["key_id"]}
+
+@app.put("/razorpay/connection/{store_id}")
+def upsert_razorpay_connection(store_id: str, payload: RazorpayConnection):
+    razorpay_connections[store_id] = {
+        "key_id":       payload.key_id,
+        "connected_at": datetime.now().isoformat(),
+    }
+    return {"connected": True, "key_id": payload.key_id}
+
+@app.delete("/razorpay/connection/{store_id}")
+def delete_razorpay_connection(store_id: str):
+    razorpay_connections.pop(store_id, None)
+    return {"disconnected": True}
+
+@app.post("/orders/razorpay")
+def create_razorpay_order(req: RazorpayOrderRequest):
+    if req.store_id not in stores:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if req.store_id not in razorpay_connections:
+        raise HTTPException(status_code=400, detail="Razorpay not connected for this store")
+
+    order_id   = str(uuid.uuid4())[:8]
+    total      = 0.0
+    line_items = []
+    for item in req.items:
+        p = products.get(item.product_id)
+        if not p:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        if p["stock"] < item.quantity:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {p['name']}")
+        subtotal = p["price"] * item.quantity
+        total   += subtotal
+        products[item.product_id]["stock"] -= item.quantity
+        line_items.append({
+            "product_id":   item.product_id,
+            "product_name": p["name"],
+            "quantity":     item.quantity,
+            "unit_price":   p["price"],
+            "subtotal":     subtotal,
+        })
+
+    orders[order_id] = {
+        "id":             order_id,
+        "store_id":       req.store_id,
+        "customer_name":  req.customer_name,
+        "customer_email": req.customer_email,
+        "address":        req.address,
+        "items":          line_items,
+        "total":          round(total, 2),
+        "status":         "confirmed",
+        "payment_method": "razorpay",
+        "razorpay_payment_id": req.payment_id,
+        "created_at":     datetime.now().isoformat(),
+    }
+    return orders[order_id]
+
+
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(f"[422] Path: {request.url.path} | Body: {body.decode()} | Errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body_received": body.decode()},
+    )
+
+# ── In-memory store (replace with your DB layer) ──────────────────────────────
+chatbot_configs: dict = {}
+razorpay_keys: dict   = {}
+return_complaints: dict = {}
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Schemas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FAQ(BaseModel):
+    question: str
+    answer:   str
+
+class ChatbotConfig(BaseModel):
+    bot_name: str       = "Store Assistant"
+    greeting: str       = "Hi! How can I help you today?"
+    faqs:     List[FAQ] = []
+    linked_store_id: Optional[str] = ""   # product/ecommerce store this chatbot sells from
+
+class ChatRequest(BaseModel):
+    store_id: Optional[str] = ""
+    message:  str
+
+    @field_validator("message")
+    @classmethod
+    def message_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("message cannot be empty")
+        return v.strip()
+
+class RefundRequest(BaseModel):
+    store_id: str
+    order_id: str
+    amount:   float
+    reason:   Optional[str] = "Customer requested refund"
+
+# REPLACE ReturnRequest:
+class ReturnRequest(BaseModel):
+    store_id:      str
+    order_id:      str
+    reason:        Optional[str] = ""
+    image_url:     Optional[str] = ""       # ✅ URL instead of base64
+    image_caption: Optional[str] = ""
+    image_base64:  Optional[str] = ""       # kept for backwards compat
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def allow_self_signed_https():
+    if not os.environ.get("PYTHONHTTPSVERIFY") and getattr(ssl, "_create_unverified_context", None):
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def get_phi4_client() -> Optional[ChatCompletionsClient]:
+    if not AZURE_API_URL or not AZURE_API_KEY:
+        print("[Phi-4] Missing API_URL or API_KEY environment variables.")
+        return None
+    try:
+        return ChatCompletionsClient(
+            endpoint=AZURE_API_URL,
+            credential=AzureKeyCredential(AZURE_API_KEY),
+        )
+    except Exception as e:
+        print(f"[Phi-4] Client init error: {e}")
+        return None
+
+
+def phi4_complete(prompt: str, system: str = "") -> str:
+    """Call Phi-4 via Azure AI Inference SDK."""
+    client = get_phi4_client()
+    if not client:
+        return "I'm having trouble connecting to my AI backend. Please try again later."
+    try:
+        msgs = []
+        if system:
+            msgs.append(SystemMessage(content=system))
+        msgs.append(UserMessage(content=prompt))
+        response = client.complete(
+            messages=msgs,
+            model=AZURE_MODEL,
+            max_tokens=512,
+            temperature=0.4,
+            top_p=1,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"AI error: {str(e)}"
+
+
+# ── Stopwords excluded from overlap scoring to avoid false FAQ matches ─────────
+STOPWORDS = {
+    "what", "is", "are", "the", "a", "an", "your", "my", "do", "does",
+    "how", "when", "where", "which", "who", "can", "i", "you", "we",
+    "it", "this", "that", "for", "of", "to", "in", "on", "at", "be",
+    "will", "have", "has", "about", "and", "or", "not", "no", "yes",
+    "me", "us", "them", "they", "he", "she", "its", "our", "their",
+    "from", "with", "by", "please", "tell", "get", "give", "want",
+}
+
+
+def faq_match(faqs: List[FAQ], question: str) -> Optional[str]:
+    """
+    Match a customer question to the closest FAQ entry.
+
+    Uses meaningful-word overlap (stopwords excluded) combined with
+    fuzzy sequence matching. Requires a combined score >= 0.5 to
+    avoid false positives from common words like 'what is your'.
+    """
+    if not faqs:
+        return None
+
+    q_lower  = question.lower()
+    q_words  = set(re.findall(r"\w+", q_lower)) - STOPWORDS
+
+    if not q_words:
+        return None
+
+    best_score  = 0.0
+    best_answer = None
+
+    for faq in faqs:
+        faq_lower = faq.question.lower()
+        faq_words = set(re.findall(r"\w+", faq_lower)) - STOPWORDS
+
+        if not faq_words:
+            continue
+
+        overlap_count = len(faq_words & q_words)
+        word_score    = overlap_count / max(len(faq_words), 1)
+
+        seq_score = difflib.SequenceMatcher(None, q_lower, faq_lower).ratio()
+
+        combined = seq_score * 0.3 + word_score * 0.7
+
+        if combined > best_score:
+            best_score  = combined
+            best_answer = faq.answer
+
+    return best_answer if best_score >= 0.5 else None
+
+
+def detect_defects(caption: str) -> dict:
+    """Classify caption for defect keywords."""
+    DEFECT_KEYWORDS = [
+        "damage", "damaged", "crack", "cracked", "broken", "defect", "defective",
+        "scratch", "scratched", "tear", "torn", "worn", "stain", "stained",
+        "missing", "dent", "dented", "fault", "faulty", "chip", "chipped",
+        "discolor", "discoloured", "rust", "rusted", "bend", "bent",
+    ]
+    caption_lower = caption.lower()
+    found = [kw for kw in DEFECT_KEYWORDS if kw in caption_lower]
+    return {
+        "defects_detected":    len(found) > 0,
+        "keywords_found":      found,
+        "eligible_for_return": len(found) > 0,
+    }
+
+
+def get_razorpay_client(store_id: str):
+    creds = razorpay_keys.get(store_id)
+    if creds:
+        return razorpay.Client(auth=(creds["key_id"], creds["key_secret"]))
+    if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+        return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chatbot Config Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/chatbot/config/{store_id}")
+async def get_chatbot_config(store_id: str):
+    """Return the chatbot configuration for a store."""
+    return chatbot_configs.get(store_id, {
+        "bot_name": "Store Assistant",
+        "greeting": "Hi! How can I help you today?",
+        "faqs":     [],
+        "linked_store_id": "",
+    })
+
+
+@app.put("/chatbot/config/{store_id}")
+async def put_chatbot_config(store_id: str, config: ChatbotConfig):
+    """Save / overwrite chatbot configuration for a store."""
+    chatbot_configs[store_id] = config.model_dump()
+    return {"success": True, "message": "Chatbot configuration saved."}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chat Endpoint — FAQ RAG + Phi-4 fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/chatbot/chat")
+async def chatbot_chat(req: ChatRequest):
+    """
+    1. Try to match against store FAQ knowledge base (strict stopword-aware matching).
+    2. If no FAQ match, call Phi-4 with the full FAQ context so it can reason
+       over the knowledge base and give a helpful, grounded answer.
+    """
+    cfg  = chatbot_configs.get(req.store_id, {})
+    faqs: List[FAQ] = [FAQ(**f) for f in cfg.get("faqs", [])]
+
+    # ── Step 1: Direct FAQ match (fast path) ──────────────────────────────────
+    faq_answer = faq_match(faqs, req.message)
+    if faq_answer:
+        return {"reply": faq_answer, "source": "faq"}
+
+    # ── Step 2: Phi-4 with FAQ knowledge base as context ──────────────────────
+    faq_context = "\n".join(
+        f"Q: {f.question}\nA: {f.answer}" for f in faqs
+    ) if faqs else "No FAQ data available."
+
+    system_prompt = f"""You are {cfg.get('bot_name', 'Store Assistant')}, a helpful and friendly customer support chatbot for this store.
+
+You have access to the store's FAQ Knowledge Base below. Use it as your primary source of truth when answering customer questions.
+
+GUIDELINES:
+1. Read the FAQ Knowledge Base carefully. If the customer's question is covered — even partially or by implication — answer using that information. You may rephrase it naturally and concisely.
+2. If the FAQ contains related or adjacent information that helps answer the question, use it to give a helpful response.
+3. If the FAQ genuinely does not contain any relevant information, respond with: "I don't have specific information on that. Please contact our support team for further assistance."
+4. Do NOT invent store-specific details (prices, policies, products, timelines) that are not present in the FAQ.
+5. Keep responses short, clear, and friendly. No unnecessary filler or greetings.
+
+FAQ Knowledge Base:
+{faq_context}"""
+
+    reply = phi4_complete(req.message, system=system_prompt)
+    return {"reply": reply, "source": "ai"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Razorpay Refund Endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/chatbot/refund")
+async def initiate_refund(req: RefundRequest):
+    """
+    Initiate a Razorpay refund for a given payment ID.
+    Pass the Razorpay payment_id (pay_XXXX) in the order_id field.
+    If an order_id (order_XXXX) is passed, we look up the captured payment first.
+    Amount is in INR — converted to paise internally.
+    """
+    rzp = get_razorpay_client(req.store_id)
+    if not rzp:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay not configured for this store. Please add your API credentials in the Payments tab.",
+        )
+
+    payment_id = req.order_id.strip()
+
+    if not payment_id.startswith("pay_"):
+        if payment_id.startswith("order_"):
+            try:
+                payments = rzp.order.payments(payment_id)
+                items    = payments.get("items", [])
+                if not items:
+                    raise HTTPException(status_code=404, detail="No payments found for this order ID.")
+                captured = [p for p in items if p.get("status") == "captured"]
+                if not captured:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No captured payment found for this order. Refund cannot be processed.",
+                    )
+                payment_id = captured[0]["id"]
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Could not resolve order to payment: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid payment ID. Must start with 'pay_' or 'order_'.")
+
+    amount_paise = int(req.amount * 100)
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="Refund amount must be greater than 0.")
+
+    try:
+        refund = rzp.payment.refund(payment_id, {
+            "amount": amount_paise,
+            "speed":  "optimum",
+            "notes": {
+                "reason":   req.reason or "Customer requested refund",
+                "store_id": req.store_id,
+            },
+        })
+        return {
+            "success":    True,
+            "refund_id":  refund.get("id"),
+            "payment_id": refund.get("payment_id"),
+            "amount":     refund.get("amount", amount_paise) / 100,
+            "status":     refund.get("status"),
+            "speed":      refund.get("speed_processed"),
+            "message":    f"Refund of ₹{req.amount:.2f} initiated successfully.",
+        }
+    except razorpay.errors.BadRequestError as e:
+        raise HTTPException(status_code=400, detail=f"Razorpay error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refund failed: {str(e)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Product Return + Image Verification Endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MODELSLAB_KEY = os.environ.get("VID_KEY")
+
+
+async def get_caption_from_modelslab(image_url: str) -> Optional[str]:
+    if not MODELSLAB_KEY:
+        print("[ModelsLab] ❌ VID_KEY not set")
+        return None
+    if not image_url:
+        print("[ModelsLab] ❌ No image URL provided")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.post(
+                "https://modelslab.com/api/v6/image_editing/caption",
+                json={"init_image": image_url, "length": "short", "key": MODELSLAB_KEY},
+            )
+            data = res.json()
+            print(f"[ModelsLab] Raw response: {data}")
+
+            # output is a URL to a JSON file — fetch it
+            output = data.get("output")
+            if isinstance(output, list) and output:
+                json_url = output[0]
+                json_res = await client.get(json_url)
+                caption_data = json_res.json()
+                print(f"[ModelsLab] Caption JSON: {caption_data}")
+                if isinstance(caption_data, list) and caption_data:
+                    caption = caption_data[0].get("caption") or caption_data[0].get("output") or str(caption_data[0])
+                else:
+                    caption = caption_data.get("caption") or caption_data.get("output") or str(caption_data)
+                return caption
+            elif isinstance(output, str):
+                return output
+
+            return data.get("caption")
+    except Exception as e:
+        print(f"[ModelsLab] Error: {e}")
+        return None
+
+
+@app.post("/chatbot/return")
+async def submit_return(req: ReturnRequest):
+    caption = req.image_caption or ""
+    print(f"[Return] image_url: '{req.image_url}'")
+
+    if not caption and req.image_url:
+        caption = await get_caption_from_modelslab(req.image_url) or ""
+        print(f"[Return] caption after ModelsLab: '{caption}'")
+
+    defect_analysis = detect_defects(caption)
+    print(f"[Return] defect_analysis: {defect_analysis}")
+
+    if caption:
+        verdict_prompt = (
+            f"A customer wants to return a product from order {req.order_id}.\n"
+            f"Reason given: {req.reason or 'Not specified'}\n"
+            f"AI image analysis of the product photo: {caption}\n"
+            f"Defect keywords found: {', '.join(defect_analysis['keywords_found']) or 'none'}\n\n"
+            "Based on this, write a SHORT (2 sentences max) customer-facing message:\n"
+            "- If defects are present: confirm the return is approved and mention next steps.\n"
+            "- If no defects: inform the customer the item appears undamaged; flag for manual review.\n"
+            "Be empathetic and professional."
+        )
+        verdict_message = phi4_complete(verdict_prompt)
+    else:
+        verdict_message = (
+            "No visible damage or defects were found in your product photo. Your return request has been rejected."
+            if not defect_analysis["defects_detected"]
+            else "Defects detected in your product image. Your return request has been approved. Please await pickup instructions."
+        )
+
+    # ── Persist the complaint so admin can view it ─────────────────────────────
+    import time
+    complaint = {
+        "store_id":         req.store_id,
+        "order_id":         req.order_id,
+        "reason":           req.reason or "",
+        "image_url":        req.image_url or "",
+        "image_caption":    caption,
+        "defects_detected": defect_analysis["defects_detected"],
+        "defect_keywords":  defect_analysis["keywords_found"],
+        "eligible":         defect_analysis["eligible_for_return"],
+        "status":           "approved" if defect_analysis["eligible_for_return"] else "manual_review",
+        "verdict_message":  verdict_message,
+        "submitted_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return_complaints.setdefault(req.store_id, []).append(complaint)
+
+    return {
+        "success":          True,
+        "order_id":         req.order_id,
+        "eligible":         defect_analysis["eligible_for_return"],
+        "defects_detected": defect_analysis["defects_detected"],
+        "defect_keywords":  defect_analysis["keywords_found"],
+        "image_caption":    caption,
+        "message":          verdict_message,
+        "status":           complaint["status"],
+    }
+
+
+# ── Add this NEW endpoint right after the one above ──────────────────────────
+
+@app.get("/chatbot/returns/{store_id}")
+async def get_return_complaints(store_id: str):
+    """Return all submitted return complaints for a store, newest first."""
+    complaints = return_complaints.get(store_id, [])
+    return {"complaints": list(reversed(complaints))}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Razorpay per-store key management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RazorpayKeyPayload(BaseModel):
+    key_id:     str
+    key_secret: Optional[str] = ""
+
+
+@app.get("/razorpay/connection/{store_id}")
+async def get_razorpay_connection(store_id: str):
+    creds = razorpay_keys.get(store_id)
+    if creds:
+        return {"connected": True, "key_id": creds["key_id"]}
+    return {"connected": False}
+
+
+@app.put("/razorpay/connection/{store_id}")
+async def put_razorpay_connection(store_id: str, payload: RazorpayKeyPayload):
+    razorpay_keys[store_id] = {
+        "key_id":     payload.key_id,
+        "key_secret": payload.key_secret or RAZORPAY_KEY_SECRET,
+    }
+    return {"success": True, "key_id": payload.key_id}
+
+
+@app.delete("/razorpay/connection/{store_id}")
+async def delete_razorpay_connection(store_id: str):
+    razorpay_keys.pop(store_id, None)
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Skin Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# Handle different OS paths
+plt = platform.system()
+if plt == "Linux":
+    pathlib.WindowsPath = pathlib.PosixPath
+
+learn = None
+labels = None
+
+def load_model():
+    global learn, labels
+    if learn is None:
+        from fastai.vision.all import load_learner
+        learn = load_learner("./export_new.pkl")
+        labels = learn.dls.vocab
+
+
+LABEL_DISPLAY_NAMES = {
+    "BLACKHEADS": "Blackheads",
+    "DARK CIRCLES ON FACE": "Dark Circles",
+    "DARK SPOTS ON FACE": "Pigmentation",
+    "DRY SKIN": "Dryness",
+    "DULL SKIN": "Dullness",
+    "EYE BAGS": "Eye Bags",
+    "FACE REDNESS": "Redness",
+    "FOREHEAD WRINKLES": "Wrinkles",
+    "HORMONAL ACNE": "Acne",
+    "LARGE PORES ON FACE": "Large Pores",
+    "OILY SKIN": "Oily Skin",
+    "RAZOR BUMPS": "Razor Bumps",
+    "ROUGH TEXTURE ON FACE": "Rough Texture",
+    "SEBACEOUS FILAMENTS": "Clogged Pores",
+    "UNDER-EYE WRINKLES": "Fine Lines",
+}
+
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    try:
+        load_model()  # <-- add this line, ensures model is loaded before use
+
+        from fastai.vision.all import PILImage
+
+        contents = await file.read()
+        img_bytes = io.BytesIO(contents)
+        img = PILImage.create(img_bytes)
+
+        pred, pred_idx, probs = learn.predict(img)
+
+        results = {
+            LABEL_DISPLAY_NAMES.get(str(labels[i]), str(labels[i])): float(probs[i])
+            for i in range(len(labels))
+        }
+        sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
+
+        return JSONResponse({
+            "top_predictions": [
+                {"label": label, "probability": round(prob, 4)}
+                for label, prob in sorted_results[:5]
+            ],
+            "all_predictions": {k: round(v, 4) for k, v in results.items()}
+        })
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+SHIPROCKET_EMAIL = os.getenv("SHIPROCKET_EMAIL")
+SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD")
+SHIPROCKET_BASE = "https://apiv2.shiprocket.in/v1/external"
+
+# In-memory: shiprocket_tokens[store_id] = { token, expires_at }
+shiprocket_tokens = {}
+# In-memory: shiprocket_connections[store_id] = { email, password, pickup_location, ... }
+shiprocket_connections = {}
+# In-memory: shipments[order_id] = { sr_order_id, awb, courier, status, tracking_url, ... }
+shipments = {}
+# In-memory: return_shipments[return_id] = { ... }
+return_shipments = {}
+
+
+# ─── Models ──────────────────────────────────────────────────────
+
+class ShiprocketConnect(BaseModel):
+    email: str
+    password: str
+
+
+class ShipOrderRequest(BaseModel):
+    order_id: str  # your internal order id
+    pickup_postcode: str
+    pickup_address: str
+    pickup_city: str
+    pickup_state: str
+    pickup_country: str = "India"
+    pickup_name: str  # seller/pickup contact name
+    pickup_phone: str
+    weight: float  # kg
+    length: float  # cm
+    breadth: float  # cm
+    height: float  # cm
+    courier_id: Optional[int] = None  # if None → auto-select cheapest
+
+
+class UpdateAddressRequest(BaseModel):
+    order_id: str
+    new_address: str
+    new_city: str
+    new_state: str
+    new_pincode: str
+    new_country: str = "India"
+
+
+class ReturnRequest(BaseModel):
+    order_id: str  # your internal order id
+    reason: str = "Customer return request"
+    pickup_postcode: str  # customer's pincode (pickup FROM customer)
+    pickup_address: str
+    pickup_city: str
+    pickup_state: str
+    pickup_name: str  # customer name
+    pickup_phone: str
+    weight: float
+    length: float
+    breadth: float
+    height: float
+
+
+# ─── Helpers ─────────────────────────────────────────────────────
+
+async def _get_sr_token(store_id: str) -> str:
+    """Get or refresh Shiprocket JWT for this store."""
+    conn = shiprocket_connections.get(store_id)
+    if not conn:
+        raise HTTPException(status_code=400, detail="Shiprocket not connected for this store")
+
+    cached = shiprocket_tokens.get(store_id)
+    if cached:
+        from datetime import timezone
+        expiry = datetime.fromisoformat(cached["expires_at"])
+        if datetime.now() < expiry:
+            return cached["token"]
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        res = await client.post(
+            f"{SHIPROCKET_BASE}/auth/login",
+            json={"email": conn["email"], "password": conn["password"]},
+        )
+        data = res.json()
+
+    token = data.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail=f"Shiprocket auth failed: {data.get('message', 'unknown')}")
+
+    # Token valid for ~24h; cache for 23h
+    from datetime import timedelta
+    shiprocket_tokens[store_id] = {
+        "token": token,
+        "expires_at": (datetime.now() + timedelta(hours=23)).isoformat(),
+    }
+    return token
+
+
+async def _sr_get(store_id: str, path: str, params: dict = None):
+    token = await _get_sr_token(store_id)
+    async with httpx.AsyncClient(timeout=20) as client:
+        res = await client.get(
+            f"{SHIPROCKET_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            params=params or {},
+        )
+        return res.status_code, res.json()
+
+
+async def _sr_post(store_id: str, path: str, payload: dict):
+    token = await _get_sr_token(store_id)
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(
+            f"{SHIPROCKET_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        return res.status_code, res.json()
+
+
+def _send_tracking_email(customer_email: str, customer_name: str, order_id: str,
+                         awb: str, courier: str, tracking_url: str):
+    """Non-fatal: logs in dev if no SMTP configured."""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print(f"[DEV] Tracking email → {customer_email}")
+        print(f"      Order: {order_id} | AWB: {awb} | Courier: {courier}")
+        print(f"      Track: {tracking_url}")
+        return
+
+    try:
+        body = (
+            f"Hi {customer_name},\n\n"
+            f"Your order #{order_id} has been shipped!\n\n"
+            f"Courier  : {courier}\n"
+            f"AWB No.  : {awb}\n"
+            f"Track    : {tracking_url}\n\n"
+            f"Thank you for shopping with us!\n"
+        )
+        msg = MIMEText(body)
+        msg["Subject"] = f"Your Order #{order_id} Has Been Shipped 🚚"
+        msg["From"] = SMTP_FROM
+        msg["To"] = customer_email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo();
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [customer_email], msg.as_string())
+    except Exception as e:
+        print(f"[WARN] Could not send tracking email: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SHIPROCKET ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 1. Connect Shiprocket account for a store ─────────────────────
+@app.post("/shiprocket/connect/{store_id}")
+async def shiprocket_connect(store_id: str, req: ShiprocketConnect):
+    if store_id not in stores:
+        raise HTTPException(status_code=404, detail="Store not found")
+    shiprocket_connections[store_id] = {
+        "email": req.email,
+        "password": req.password,
+        "connected_at": datetime.now().isoformat(),
+    }
+    # Validate credentials immediately
+    await _get_sr_token(store_id)
+    return {"connected": True, "email": req.email}
+
+
+@app.get("/shiprocket/connection/{store_id}")
+async def shiprocket_get_connection(store_id: str):
+    print(f"[SR] SHIPROCKET_EMAIL={SHIPROCKET_EMAIL!r}")
+    print(f"[SR] SHIPROCKET_PASSWORD={SHIPROCKET_PASSWORD!r}")
+    print(f"[SR] store_id={store_id!r}")
+    print(f"[SR] already in connections: {store_id in shiprocket_connections}")
+
+    if store_id not in shiprocket_connections:
+        if SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD:
+            shiprocket_connections[store_id] = {
+                "email": SHIPROCKET_EMAIL,
+                "password": SHIPROCKET_PASSWORD,
+                "connected_at": datetime.now().isoformat(),
+            }
+            try:
+                await _get_sr_token(store_id)
+                print(f"[SR] token fetch SUCCESS")
+            except Exception as e:
+                print(f"[SR] token fetch FAILED: {e}")
+                shiprocket_connections.pop(store_id, None)
+                return {"connected": False}
+        else:
+            print(f"[SR] env vars missing, returning not connected")
+            return {"connected": False}
+
+    conn = shiprocket_connections[store_id]
+    print(f"[SR] returning connected=True email={conn['email']!r}")
+    return {"connected": True, "email": conn["email"], "connected_at": conn["connected_at"]}
+
+
+@app.delete("/shiprocket/connection/{store_id}")
+def shiprocket_disconnect(store_id: str):
+    shiprocket_connections.pop(store_id, None)
+    shiprocket_tokens.pop(store_id, None)
+    return {"disconnected": True}
+
+
+# ── 2. List pickup addresses saved in Shiprocket ──────────────────
+@app.get("/shiprocket/pickup-addresses/{store_id}")
+async def list_pickup_addresses(store_id: str):
+    status, data = await _sr_get(store_id, "/settings/company/pickup")
+    if status != 200:
+        raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch pickup addresses"))
+    return data.get("data", {}).get("shipping_address", [])
+
+
+# ── 3. Get courier serviceability & rates (sorted cheapest first) ─
+@app.get("/shiprocket/couriers/{store_id}")
+async def get_couriers(
+        store_id: str,
+        pickup_postcode: str,
+        delivery_postcode: str,
+        weight: float,
+        cod: int = 0,
+        cod_amount: float = 0,
+):
+    status, data = await _sr_get(store_id, "/courier/serviceability/", params={
+        "pickup_postcode": pickup_postcode,
+        "delivery_postcode": delivery_postcode,
+        "weight": weight,
+        "cod": cod,
+        "cod_amount": cod_amount if cod else 0,
+    })
+    if status != 200:
+        raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch couriers"))
+
+    available = data.get("data", {}).get("available_courier_companies", [])
+    # Sort by rate ascending (cheapest first)
+    available.sort(key=lambda x: float(x.get("rate", 9999)))
+    return {"couriers": available}
+
+
+class PickupAddressRequest(BaseModel):
+    pickup_location: str      # the label, e.g. "Primary"
+    name: str
+    email: str
+    phone: str
+    address: str
+    address_2: Optional[str] = ""
+    city: str
+    state: str
+    country: str = "India"
+    pin_code: str
+
+
+@app.post("/shiprocket/pickup-address/{store_id}")
+async def create_pickup_address(store_id: str, req: PickupAddressRequest):
+    sr_status, data = await _sr_post(store_id, "/settings/company/addpickup", req.dict())
+    print(f"[Shiprocket] create pickup: status={sr_status} data={data}")
+    if sr_status not in (200, 201):
+        raise HTTPException(status_code=502, detail=data.get("message", "Failed to create pickup address"))
+    return data
+
+
+# ── 4. Create shipment & assign courier ───────────────────────────
+@app.post("/shiprocket/ship/{store_id}")
+async def ship_order(store_id: str, req: ShipOrderRequest):
+    print(f"[Shiprocket] ship_order called store_id={store_id} req={req}")  # ← add this
+    order = orders.get(req.order_id)
+    print(f"[Shiprocket] order lookup: {order}")  # ← add this
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["store_id"] != store_id:
+        print(f"[Shiprocket] store mismatch: order.store_id={order['store_id']} != store_id={store_id}")  # ← add this
+        raise HTTPException(status_code=403, detail="Order does not belong to this store")
+
+    # ── Fetch real pickup location name from Shiprocket ──
+    sr_status_pl, pl_data = await _sr_get(store_id, "/settings/company/pickup")
+    print(f"[Shiprocket] pickup locations: {pl_data}")
+
+    pickup_location_name = None
+    if sr_status_pl == 200:
+        addresses = pl_data.get("data", {}).get("shipping_address", [])
+        if addresses:
+            # Use first active pickup location
+            active = next((a for a in addresses if a.get("is_primary_location") == 1), None)
+            pickup_location_name = (active or addresses[0]).get("pickup_location", "")
+
+    if not pickup_location_name:
+        raise HTTPException(status_code=400,
+                            detail="No pickup location found in your Shiprocket account. Add one at Settings → Manage Pickup Addresses.")
+
+    print(f"[Shiprocket] using pickup_location='{pickup_location_name}'")
+
+    # --- Step 1: Create Shiprocket order ---
+    # resolve delivery address fields with fallbacks
+    delivery_address = order.get("address") or req.pickup_address
+    delivery_city = order.get("delivery_city") or req.pickup_city
+    delivery_pincode = order.get("delivery_pincode") or req.pickup_postcode
+    delivery_state = order.get("delivery_state") or req.pickup_state
+
+    billing_phone_raw = re.sub(r"\D", "", order.get("customer_phone") or "")
+    billing_phone = billing_phone_raw[:10] if len(billing_phone_raw) >= 10 else None
+
+    if not billing_phone:
+        raise HTTPException(status_code=400, detail="Customer phone number is missing on this order. Cannot ship without a valid 10-digit phone.")
+
+
+    sr_order_payload = {
+        "order_id": req.order_id,
+        "order_date": order["created_at"][:10],
+        "pickup_location": pickup_location_name,
+        "billing_customer_name": order["customer_name"],
+        "billing_last_name": "",
+        "billing_address": delivery_address,
+        "billing_address_2": "",  # required key, even if empty string
+        "billing_city": delivery_city,
+        "billing_pincode": delivery_pincode,
+        "billing_state": delivery_state,
+        "billing_country": "India",
+        "billing_email": order["customer_email"],
+        "billing_phone": billing_phone,
+        "shipping_is_billing": True,
+        "order_items": [
+            {
+                "name": item["product_name"],
+                "sku": item["product_id"],
+                "units": item["quantity"],
+                "selling_price": item["unit_price"],
+            }
+            for item in order["items"]
+        ],
+        "payment_method": "Prepaid",
+        "sub_total": order["total"],
+        "length": req.length,
+        "breadth": req.breadth,
+        "height": req.height,
+        "weight": req.weight,
+    }
+
+    try:
+        sr_status, sr_data = await _sr_post(store_id, "/orders/create/adhoc", sr_order_payload)
+        print(f"[Shiprocket] create order status={sr_status} response={sr_data}")
+    except Exception as e:
+        print(f"[Shiprocket] _sr_post exception: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail=f"Shiprocket request failed: {str(e)}")
+
+    if sr_status not in (200, 201) or not sr_data.get("order_id"):
+        raise HTTPException(status_code=502, detail=sr_data.get("message", "Shiprocket order creation failed"))
+
+    sr_order_id = sr_data["order_id"]
+    sr_shipment_id = sr_data.get("shipment_id")
+
+    # --- Step 2: Assign courier ---
+    assign_payload: dict = {"shipment_id": [sr_shipment_id]}
+    if req.courier_id:
+        assign_payload["courier_id"] = req.courier_id
+
+    _, assign_data = await _sr_post(store_id, "/courier/assign/awb", assign_payload)
+    awb = assign_data.get("response", {}).get("data", {}).get("awb_code", "")
+    courier_name = assign_data.get("response", {}).get("data", {}).get("courier_name", "")
+
+    # --- Step 3: Schedule pickup ---
+    _, pickup_data = await _sr_post(store_id, "/courier/generate/pickup", {
+        "shipment_id": [sr_shipment_id],
+    })
+    pickup_scheduled = pickup_data.get("pickup_status", 1) == 1
+
+    tracking_url = f"https://shiprocket.co/tracking/{awb}" if awb else ""
+
+    # Store shipment record
+    shipments[req.order_id] = {
+        "order_id": req.order_id,
+        "sr_order_id": sr_order_id,
+        "sr_shipment_id": sr_shipment_id,
+        "awb": awb,
+        "courier": courier_name,
+        "tracking_url": tracking_url,
+        "status": "pickup_scheduled" if pickup_scheduled else "assigned",
+        "pickup_scheduled": pickup_scheduled,
+        "created_at": datetime.now().isoformat(),
+        "store_id": store_id,
+    }
+
+    # Update order status
+    orders[req.order_id]["status"] = "shipped"
+    orders[req.order_id]["tracking_url"] = tracking_url
+    orders[req.order_id]["awb"] = awb
+    orders[req.order_id]["courier"] = courier_name
+
+    # --- Step 4: Email customer ---
+    _send_tracking_email(
+        customer_email=order["customer_email"],
+        customer_name=order["customer_name"],
+        order_id=req.order_id,
+        awb=awb,
+        courier=courier_name,
+        tracking_url=tracking_url,
+    )
+
+    return {
+        "success": True,
+        "sr_order_id": sr_order_id,
+        "sr_shipment_id": sr_shipment_id,
+        "awb": awb,
+        "courier": courier_name,
+        "tracking_url": tracking_url,
+        "pickup_scheduled": pickup_scheduled,
+    }
+
+
+# ── 5. Track shipment ─────────────────────────────────────────────
+@app.get("/shiprocket/track/{order_id}")
+async def track_shipment(order_id: str):
+    shipment = shipments.get(order_id)
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found for this order")
+
+    store_id = shipment["store_id"]
+    awb = shipment.get("awb", "")
+    if not awb:
+        return {**shipment, "tracking_data": None}
+
+    status, data = await _sr_get(store_id, f"/courier/track/awb/{awb}")
+    tracking_data = data.get("tracking_data") if status == 200 else None
+
+    return {
+        **shipment,
+        "tracking_data": tracking_data,
+    }
+
+
+# ── 6. Get shipment details for an order ──────────────────────────
+@app.get("/shiprocket/shipment/{order_id}")
+def get_shipment(order_id: str):
+    shipment = shipments.get(order_id)
+    if not shipment:
+        return {"exists": False}
+    return {**shipment, "exists": True}
+
+
+# ── 7. Update delivery address (before shipped) ───────────────────
+@app.put("/shiprocket/update-address/{store_id}")
+async def update_delivery_address(store_id: str, req: UpdateAddressRequest):
+    order = orders.get(req.order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["store_id"] != store_id:
+        raise HTTPException(status_code=403, detail="Order does not belong to this store")
+    if order.get("status") == "shipped":
+        raise HTTPException(status_code=400, detail="Cannot update address after order is shipped")
+
+    # Persist to local order record
+    orders[req.order_id]["address"] = req.new_address
+    orders[req.order_id]["delivery_city"] = req.new_city
+    orders[req.order_id]["delivery_state"] = req.new_state
+    orders[req.order_id]["delivery_pincode"] = req.new_pincode
+    orders[req.order_id]["delivery_country"] = req.new_country
+
+    # If Shiprocket order already created, patch it
+    shipment = shipments.get(req.order_id)
+    if shipment and shipment.get("sr_order_id"):
+        _, data = await _sr_post(store_id, f"/orders/address/update", {
+            "order_id": shipment["sr_order_id"],
+            "shipping_address": req.new_address,
+            "shipping_city": req.new_city,
+            "shipping_state": req.new_state,
+            "shipping_pincode": req.new_pincode,
+            "shipping_country": req.new_country,
+        })
+        if not data.get("status"):
+            print(f"[WARN] Shiprocket address update failed: {data}")
+
+    return {"updated": True, "order_id": req.order_id}
+
+
+# ── 8. Initiate return shipment ───────────────────────────────────
+@app.post("/shiprocket/return/{store_id}")
+async def create_return(store_id: str, req: ReturnRequest):
+    order = orders.get(req.order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["store_id"] != store_id:
+        raise HTTPException(status_code=403, detail="Order does not belong to this store")
+
+    store = stores[store_id]
+
+    return_payload = {
+        "order_id": f"RET-{req.order_id}-{str(uuid.uuid4())[:4]}",
+        "order_date": datetime.now().strftime("%Y-%m-%d"),
+        # Pickup FROM customer
+        "pickup_customer_name": req.pickup_name,
+        "pickup_last_name": "",
+        "pickup_address": req.pickup_address,
+        "pickup_address_2": "",
+        "pickup_city": req.pickup_city,
+        "pickup_state": req.pickup_state,
+        "pickup_country": "India",
+        "pickup_pincode": req.pickup_postcode,
+        "pickup_email": order["customer_email"],
+        "pickup_phone": req.pickup_phone,
+        # Deliver TO seller (store)
+        "shipping_customer_name": store.get("name", "Seller"),
+        "shipping_last_name": "",
+        "shipping_address": store.get("pickup_address", order.get("address", "")),
+        "shipping_city": store.get("pickup_city", ""),
+        "shipping_pincode": store.get("pickup_pincode", req.pickup_postcode),
+        "shipping_state": store.get("pickup_state", req.pickup_state),
+        "shipping_country": "India",
+        "shipping_email": store.get("owner_email", order["customer_email"]),
+        "shipping_phone": store.get("owner_phone", req.pickup_phone),
+        "order_items": [
+            {
+                "name": item["product_name"],
+                "sku": item["product_id"],
+                "units": item["quantity"],
+                "selling_price": item["unit_price"],
+            }
+            for item in order["items"]
+        ],
+        "payment_method": "Prepaid",
+        "sub_total": order["total"],
+        "length": req.length,
+        "breadth": req.breadth,
+        "height": req.height,
+        "weight": req.weight,
+    }
+
+    sr_status, sr_data = await _sr_post(store_id, "/orders/create/return", return_payload)
+    if sr_status not in (200, 201):
+        raise HTTPException(status_code=502, detail=sr_data.get("message", "Return creation failed"))
+
+    return_id = str(uuid.uuid4())[:8]
+    sr_order_id = sr_data.get("order_id")
+    sr_shipment_id = sr_data.get("shipment_id")
+
+    # Assign courier (auto-cheapest)
+    awb = ""
+    courier_name = ""
+    if sr_shipment_id:
+        _, assign_data = await _sr_post(store_id, "/courier/assign/awb", {"shipment_id": [sr_shipment_id]})
+        awb = assign_data.get("response", {}).get("data", {}).get("awb_code", "")
+        courier_name = assign_data.get("response", {}).get("data", {}).get("courier_name", "")
+
+    tracking_url = f"https://shiprocket.co/tracking/{awb}" if awb else ""
+
+    return_shipments[return_id] = {
+        "return_id": return_id,
+        "order_id": req.order_id,
+        "sr_order_id": sr_order_id,
+        "sr_shipment_id": sr_shipment_id,
+        "awb": awb,
+        "courier": courier_name,
+        "tracking_url": tracking_url,
+        "reason": req.reason,
+        "status": "return_initiated",
+        "created_at": datetime.now().isoformat(),
+        "store_id": store_id,
+    }
+
+    # Mark original order as return-initiated
+    orders[req.order_id]["return_status"] = "return_initiated"
+    orders[req.order_id]["return_id"] = return_id
+    orders[req.order_id]["return_tracking"] = tracking_url
+
+    return {
+        "success": True,
+        "return_id": return_id,
+        "sr_order_id": sr_order_id,
+        "awb": awb,
+        "courier": courier_name,
+        "tracking_url": tracking_url,
+    }
+
+
+# ── 9. List returns for a store ───────────────────────────────────
+@app.get("/shiprocket/returns/{store_id}")
+def list_returns(store_id: str):
+    return [r for r in return_shipments.values() if r["store_id"] == store_id]
+
+
+# ── 10. Shiprocket webhook (tracking updates) ─────────────────────
+@app.post("/shiprocket/webhook")
+async def shiprocket_webhook(request: dict):
+    """
+    Shiprocket sends POST with tracking events.
+    Configure: Shiprocket Dashboard → Settings → API → Webhooks
+    URL: https://yourdomain.com/shiprocket/webhook
+    """
+    awb = request.get("awb", "")
+    current_status = request.get("current_status", "")
+    sr_order_id = str(request.get("sr_order_id", ""))
+
+    # Find matching shipment
+    for order_id, s in shipments.items():
+        if s.get("awb") == awb or str(s.get("sr_order_id", "")) == sr_order_id:
+            shipments[order_id]["status"] = current_status
+            shipments[order_id]["last_updated"] = datetime.now().isoformat()
+            shipments[order_id]["tracking_events"] = request.get("scans", [])
+            orders[order_id]["shipping_status"] = current_status
+            break
+
+    return {"received": True}
 
 
 if __name__ == "__main__":
