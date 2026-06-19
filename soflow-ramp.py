@@ -54,6 +54,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, F
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
+from fastapi.responses import JSONResponse, FileResponse
 
 # ── Third-Party: HTTP Clients ─────────────────────────────────────────────────
 import httpx
@@ -83,6 +84,19 @@ from fastai.vision.all import PILImage
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import UserMessage, SystemMessage
 from azure.core.credentials import AzureKeyCredential
+
+# ── PDF invoice generation libs ────────────────────────────────────
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+)
+from reportlab.lib.enums import TA_RIGHT, TA_LEFT, TA_CENTER
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 
 # ── Environment ───────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
@@ -146,11 +160,6 @@ orders   = {}
 reviews  = {}
 
 FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-# ─── Cashfree KYC credentials ────────────────────────────────────
-CASHFREE_CLIENT_ID     = os.getenv("CASHFREE_CLIENT_ID")
-CASHFREE_CLIENT_SECRET = os.getenv("CASHFREE_CLIENT_SECRET")
-CASHFREE_BASE_URL      = os.getenv("CASHFREE_BASE_URL", "https://api.cashfree.com/verification")
 
 # ─── SMTP settings (for OTP emails) ─────────────────────────────
 SMTP_HOST     = os.getenv("SMTP_HOST", "mail.privateemail.com")
@@ -729,7 +738,7 @@ def gmail_callback(code: str, state: str):
 
     import google.oauth2.credentials
     creds.refresh(google.auth.transport.requests.Request())
-    userinfo = pyrequests.get(
+    userinfo = requests.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
         headers={"Authorization": f"Bearer {creds.token}"}
     ).json()
@@ -2463,12 +2472,485 @@ async def debug_instagram(session_id: str = Depends(get_session_id)):
     return {"stored_keys": list(token_data.keys()), "me": me}
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  GST INVOICE GENERATION  (merged in directly — no separate module)
+# ═══════════════════════════════════════════════════════════════════
+
+DEFAULT_GST_RATE = 18.0  # used only if a product has no gst_rate set
+
+# ── Font registration ──────────────────────────────────────────────
+# Base PDF fonts (Helvetica) have no glyph for ₹ and render it as a
+# black box. DejaVu Sans ships on most Linux systems and includes it.
+# If unavailable, fall back to "Rs." text so nothing breaks silently.
+_RUPEE_FONT_REGULAR = "Helvetica"
+_RUPEE_FONT_BOLD = "Helvetica-Bold"
+_RUPEE_SYMBOL = "Rs. "
+
+_DEJAVU_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+if os.path.exists(_DEJAVU_REGULAR) and os.path.exists(_DEJAVU_BOLD):
+    try:
+        pdfmetrics.registerFont(TTFont("DejaVuSans", _DEJAVU_REGULAR))
+        pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", _DEJAVU_BOLD))
+        _RUPEE_FONT_REGULAR = "DejaVuSans"
+        _RUPEE_FONT_BOLD = "DejaVuSans-Bold"
+        _RUPEE_SYMBOL = "\u20b9"  # ₹ glyph is safe to use with this font
+    except Exception:
+        pass
+
+
+def fmt_inr(amount: float) -> str:
+    """Format a number as an INR amount string using whichever rupee
+    representation is safe for the registered font."""
+    return f"{_RUPEE_SYMBOL}{amount:,.2f}"
+
+
+# State code -> name map (first 2 digits of GSTIN identify the state).
+# Used to decide CGST+SGST (intra-state) vs IGST (inter-state).
+GST_STATE_CODES = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam",
+    "19": "West Bengal", "20": "Jharkhand", "21": "Odisha",
+    "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "26": "Dadra and Nagar Haveli and Daman and Diu", "27": "Maharashtra",
+    "29": "Karnataka", "30": "Goa", "31": "Lakshadweep", "32": "Kerala",
+    "33": "Tamil Nadu", "34": "Puducherry", "35": "Andaman and Nicobar Islands",
+    "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh", "97": "Other Territory",
+}
+
+STATE_NAME_TO_CODE = {v.lower(): k for k, v in GST_STATE_CODES.items()}
+
+
+def _state_code_from_gstin(gstin: str) -> str:
+    if not gstin or len(gstin) < 2:
+        return ""
+    return gstin[:2]
+
+
+def _state_code_from_name(name: str) -> str:
+    if not name:
+        return ""
+    return STATE_NAME_TO_CODE.get(name.strip().lower(), "")
+
+
+def compute_invoice_tax(line_items, seller_gstin: str, delivery_state: str):
+    """
+    line_items: list of dicts with keys:
+        product_name, quantity, unit_price, subtotal, hsn_code, gst_rate
+    seller_gstin: store's GSTIN (e.g. "33ABCDE1234F1Z5"). Empty/None means
+        the seller is NOT GST-registered, in which case NO tax is charged
+        on any line item regardless of any gst_rate set on the product —
+        an unregistered seller cannot legally collect GST.
+    delivery_state: buyer's delivery state name (e.g. "Tamil Nadu")
+
+    Returns (enriched_items, totals, tax_type) where tax_type is
+    "CGST_SGST" (intra-state), "IGST" (inter-state), or "UNREGISTERED"
+    (seller not GST-registered — bill of supply, zero tax).
+    """
+    seller_gstin = (seller_gstin or "").strip()
+
+    if not seller_gstin:
+        # Bill of supply: no GST charged at all.
+        enriched = []
+        grand_subtotal = 0.0
+        for item in line_items:
+            taxable_value = float(item["subtotal"])
+            grand_subtotal += taxable_value
+            enriched.append({
+                "product_name": item["product_name"],
+                "hsn_code": item.get("hsn_code") or "—",
+                "quantity": item["quantity"],
+                "unit_price": float(item["unit_price"]),
+                "taxable_value": taxable_value,
+                "gst_rate": 0.0,
+                "cgst_rate": 0.0, "cgst_amt": 0.0,
+                "sgst_rate": 0.0, "sgst_amt": 0.0,
+                "igst_rate": 0.0, "igst_amt": 0.0,
+                "line_total": taxable_value,
+            })
+        totals = {
+            "subtotal": grand_subtotal, "cgst": 0.0, "sgst": 0.0, "igst": 0.0,
+            "total_tax": 0.0, "grand_total": grand_subtotal,
+        }
+        return enriched, totals, "UNREGISTERED"
+
+    seller_state_code = _state_code_from_gstin(seller_gstin)
+    buyer_state_code = _state_code_from_name(delivery_state)
+
+    # If we can't determine the buyer's state, default to intra-state
+    # (CGST+SGST) since that's the more common case for most small
+    # sellers and avoids under-charging IGST incorrectly.
+    same_state = (not buyer_state_code) or (seller_state_code == buyer_state_code)
+    tax_type = "CGST_SGST" if same_state else "IGST"
+
+    enriched = []
+    grand_subtotal = 0.0
+    grand_cgst = 0.0
+    grand_sgst = 0.0
+    grand_igst = 0.0
+
+    for item in line_items:
+        rate = item.get("gst_rate")
+        if rate is None or rate == "":
+            rate = DEFAULT_GST_RATE
+        rate = float(rate)
+
+        taxable_value = float(item["subtotal"])
+        tax_amount = taxable_value * rate / 100.0
+
+        row = {
+            "product_name": item["product_name"],
+            "hsn_code": item.get("hsn_code") or "—",
+            "quantity": item["quantity"],
+            "unit_price": float(item["unit_price"]),
+            "taxable_value": taxable_value,
+            "gst_rate": rate,
+        }
+
+        if tax_type == "CGST_SGST":
+            cgst = tax_amount / 2.0
+            sgst = tax_amount / 2.0
+            row["cgst_rate"] = rate / 2.0
+            row["sgst_rate"] = rate / 2.0
+            row["cgst_amt"] = cgst
+            row["sgst_amt"] = sgst
+            row["igst_rate"] = 0.0
+            row["igst_amt"] = 0.0
+            grand_cgst += cgst
+            grand_sgst += sgst
+        else:
+            row["cgst_rate"] = 0.0
+            row["sgst_rate"] = 0.0
+            row["cgst_amt"] = 0.0
+            row["sgst_amt"] = 0.0
+            row["igst_rate"] = rate
+            row["igst_amt"] = tax_amount
+            grand_igst += tax_amount
+
+        row["line_total"] = taxable_value + tax_amount
+        grand_subtotal += taxable_value
+        enriched.append(row)
+
+    totals = {
+        "subtotal": grand_subtotal,
+        "cgst": grand_cgst,
+        "sgst": grand_sgst,
+        "igst": grand_igst,
+        "total_tax": grand_cgst + grand_sgst + grand_igst,
+        "grand_total": grand_subtotal + grand_cgst + grand_sgst + grand_igst,
+    }
+    return enriched, totals, tax_type
+
+
+def number_to_words_inr(amount: float) -> str:
+    """Simple INR amount-in-words for invoice footer (Indian numbering)."""
+    try:
+        from num2words import num2words
+        rupees = int(amount)
+        paise = round((amount - rupees) * 100)
+        words = num2words(rupees, lang="en_IN").replace(",", "").title()
+        if paise:
+            words += f" Rupees and {num2words(paise, lang='en_IN').title()} Paise"
+        else:
+            words += " Rupees"
+        return words + " Only"
+    except Exception:
+        return f"INR {amount:,.2f} Only"
+
+
+def generate_invoice_pdf(*, order: dict, store: dict, output_path: str) -> str:
+    """
+    Build a GST-compliant tax invoice PDF for a confirmed order.
+
+    order: the order dict as stored in `orders[order_id]`, expected keys:
+        id, customer_name, customer_email, customer_phone, address,
+        delivery_city, delivery_state, delivery_pincode, items, total,
+        created_at, razorpay_payment_id / payment_method
+        items: list of {product_id, product_name, quantity, unit_price, subtotal}
+
+    store: the store dict, expected keys:
+        id, name, gstin, address (or business_address), email, owner
+
+    output_path: full path to write the PDF to.
+
+    Returns output_path.
+    """
+    # Pull per-product hsn_code / gst_rate from the order's line items
+    # (snapshotted at purchase time — see create_razorpay_order below).
+    items_for_tax = []
+    for li in order["items"]:
+        items_for_tax.append({
+            "product_name": li["product_name"],
+            "quantity": li["quantity"],
+            "unit_price": li["unit_price"],
+            "subtotal": li["subtotal"],
+            "hsn_code": li.get("hsn_code", ""),
+            "gst_rate": li.get("gst_rate", None),
+        })
+
+    enriched_items, totals, tax_type = compute_invoice_tax(
+        items_for_tax,
+        seller_gstin=store.get("gstin", ""),
+        delivery_state=order.get("delivery_state", ""),
+    )
+
+    doc = SimpleDocTemplate(
+        output_path, pagesize=A4,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        leftMargin=14 * mm, rightMargin=14 * mm,
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle("InvTitle", parent=styles["Title"], fontSize=16,
+                                 alignment=TA_CENTER, spaceAfter=2, fontName=_RUPEE_FONT_BOLD)
+    small = ParagraphStyle("Small", parent=styles["Normal"], fontSize=8.5, leading=11,
+                           fontName=_RUPEE_FONT_REGULAR)
+    small_right = ParagraphStyle("SmallRight", parent=small, alignment=TA_RIGHT)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=11, spaceAfter=4, fontName=_RUPEE_FONT_BOLD)
+
+    is_registered = bool((store.get("gstin") or "").strip())
+
+    story.append(Paragraph("TAX INVOICE" if is_registered else "INVOICE (Seller Not GST Registered)", title_style))
+    story.append(Spacer(1, 4))
+
+    # ── Seller / Invoice meta block ──────────────────────────────
+    seller_lines = [f"<b>{store.get('name', 'Store')}</b>"]
+    if store.get("address"):
+        seller_lines.append(store["address"])
+    if is_registered:
+        seller_lines.append(f"GSTIN: {store['gstin']}")
+    if store.get("email"):
+        seller_lines.append(store["email"])
+    seller_para = Paragraph("<br/>".join(seller_lines), small)
+
+    invoice_no = f"INV-{order['id'].upper()}"
+    created_at = order.get("created_at", "")
+    try:
+        date_str = datetime.fromisoformat(created_at).strftime("%d %b %Y")
+    except Exception:
+        date_str = created_at[:10] if created_at else datetime.now().strftime("%d %b %Y")
+
+    meta_lines = [
+        f"<b>Invoice No:</b> {invoice_no}",
+        f"<b>Invoice Date:</b> {date_str}",
+        f"<b>Order ID:</b> {order['id']}",
+    ]
+    if order.get("razorpay_payment_id"):
+        meta_lines.append(f"<b>Payment Ref:</b> {order['razorpay_payment_id']}")
+    meta_para = Paragraph("<br/>".join(meta_lines), small_right)
+
+    header_table = Table([[seller_para, meta_para]], colWidths=[100 * mm, 80 * mm])
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 10))
+
+    # ── Bill To / Ship To ────────────────────────────────────────
+    buyer_lines = [
+        "<b>Bill To / Ship To:</b>",
+        order.get("customer_name", ""),
+    ]
+    addr_bits = [order.get("address", "")]
+    city_state_pin = ", ".join(filter(None, [
+        order.get("delivery_city", ""), order.get("delivery_state", ""), order.get("delivery_pincode", "")
+    ]))
+    if city_state_pin:
+        addr_bits.append(city_state_pin)
+    buyer_lines.append(", ".join(filter(None, addr_bits)))
+    if order.get("customer_phone"):
+        buyer_lines.append(f"Phone: {order['customer_phone']}")
+    if order.get("customer_email"):
+        buyer_lines.append(order["customer_email"])
+
+    story.append(Paragraph("<br/>".join(filter(None, buyer_lines)), small))
+    story.append(Spacer(1, 4))
+
+    place_of_supply = order.get("delivery_state", "") or "—"
+    tax_type_label = {
+        "CGST_SGST": "CGST + SGST",
+        "IGST": "IGST",
+        "UNREGISTERED": "No GST (Bill of Supply)",
+    }.get(tax_type, tax_type)
+    story.append(Paragraph(f"<b>Place of Supply:</b> {place_of_supply} &nbsp;&nbsp; "
+                           f"<b>Tax Type:</b> {tax_type_label}", small))
+    story.append(Spacer(1, 10))
+
+    # ── Line items table ─────────────────────────────────────────
+    rupee_label = _RUPEE_SYMBOL.strip() if _RUPEE_SYMBOL != "Rs. " else "Rs"
+    if tax_type == "CGST_SGST":
+        head = ["#", "Item", "HSN", "Qty", f"Rate ({rupee_label})", f"Taxable ({rupee_label})",
+                "CGST %", f"CGST ({rupee_label})", "SGST %", f"SGST ({rupee_label})", f"Total ({rupee_label})"]
+    elif tax_type == "IGST":
+        head = ["#", "Item", "HSN", "Qty", f"Rate ({rupee_label})", f"Taxable ({rupee_label})",
+                "IGST %", f"IGST ({rupee_label})", f"Total ({rupee_label})"]
+    else:  # UNREGISTERED — no tax columns
+        head = ["#", "Item", "HSN", "Qty", f"Rate ({rupee_label})", f"Amount ({rupee_label})"]
+
+    rows = [head]
+    for i, it in enumerate(enriched_items, start=1):
+        if tax_type == "CGST_SGST":
+            rows.append([
+                str(i), it["product_name"], it["hsn_code"], str(it["quantity"]),
+                f"{it['unit_price']:.2f}", f"{it['taxable_value']:.2f}",
+                f"{it['cgst_rate']:.1f}%", f"{it['cgst_amt']:.2f}",
+                f"{it['sgst_rate']:.1f}%", f"{it['sgst_amt']:.2f}",
+                f"{it['line_total']:.2f}",
+            ])
+        elif tax_type == "IGST":
+            rows.append([
+                str(i), it["product_name"], it["hsn_code"], str(it["quantity"]),
+                f"{it['unit_price']:.2f}", f"{it['taxable_value']:.2f}",
+                f"{it['igst_rate']:.1f}%", f"{it['igst_amt']:.2f}",
+                f"{it['line_total']:.2f}",
+            ])
+        else:  # UNREGISTERED
+            rows.append([
+                str(i), it["product_name"], it["hsn_code"], str(it["quantity"]),
+                f"{it['unit_price']:.2f}", f"{it['line_total']:.2f}",
+            ])
+
+    if tax_type == "CGST_SGST":
+        col_widths = [8 * mm, 42 * mm, 16 * mm, 10 * mm, 18 * mm, 20 * mm, 14 * mm, 16 * mm, 14 * mm, 16 * mm, 18 * mm]
+    elif tax_type == "IGST":
+        col_widths = [8 * mm, 55 * mm, 18 * mm, 10 * mm, 20 * mm, 22 * mm, 16 * mm, 18 * mm, 20 * mm]
+    else:  # UNREGISTERED
+        col_widths = [10 * mm, 80 * mm, 24 * mm, 14 * mm, 28 * mm, 28 * mm]
+
+    item_table = Table(rows, colWidths=col_widths, repeatRows=1)
+    item_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("FONTNAME", (0, 0), (-1, -1), _RUPEE_FONT_REGULAR),
+        ("FONTNAME", (0, 0), (-1, 0), _RUPEE_FONT_BOLD),
+        ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+        ("ALIGN", (0, 0), (0, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(item_table)
+    story.append(Spacer(1, 8))
+
+    # ── Totals block ──────────────────────────────────────────────
+    total_rows = [["Taxable Value", fmt_inr(totals['subtotal'])]]
+    if tax_type == "CGST_SGST":
+        total_rows.append(["CGST", fmt_inr(totals['cgst'])])
+        total_rows.append(["SGST", fmt_inr(totals['sgst'])])
+    elif tax_type == "IGST":
+        total_rows.append(["IGST", fmt_inr(totals['igst'])])
+    # UNREGISTERED: no tax rows at all — subtotal IS the grand total.
+    total_rows.append(["Shipping", "Free"])
+    total_rows.append(["Grand Total", fmt_inr(totals['grand_total'])])
+
+    totals_table = Table(total_rows, colWidths=[40 * mm, 30 * mm])
+    totals_table.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("FONTNAME", (0, 0), (-1, -1), _RUPEE_FONT_REGULAR),
+        ("FONTNAME", (0, -1), (-1, -1), _RUPEE_FONT_BOLD),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+
+    wrapper = Table([[Paragraph("", small), totals_table]], colWidths=[120 * mm, 70 * mm])
+    wrapper.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story.append(wrapper)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph(f"<b>Amount in Words:</b> {number_to_words_inr(totals['grand_total'])}", small))
+    story.append(Spacer(1, 10))
+
+    if not is_registered:
+        story.append(Paragraph(
+            "Note: Seller is not registered under GST. This is a bill of supply, "
+            "no GST has been charged on this order.", small
+        ))
+        story.append(Spacer(1, 6))
+
+    story.append(Paragraph(
+        "This is a system-generated invoice fro Brandmake.click and does not require a physical signature.",
+        ParagraphStyle("Footer", parent=small, textColor=colors.HexColor("#888888"),
+                       alignment=TA_LEFT, fontName=_RUPEE_FONT_REGULAR)
+    ))
+
+    doc.build(story)
+    return output_path
+
+
+def build_invoice_for_order(order: dict, store: dict, out_dir: str = "/tmp/invoices") -> str:
+    """Convenience wrapper: builds the PDF and returns its file path."""
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"invoice_{order['id']}.pdf")
+    # Unregistered seller still gets an invoice — just with zero GST (bill of supply)
+    return generate_invoice_pdf(order=order, store=store, output_path=out_path)
+
+
+def send_invoice_email(order: dict, store: dict, pdf_path: str):
+    to_email = order.get("customer_email")
+    if not to_email:
+        return
+
+    if not SMTP_USER or not SMTP_PASSWORD or not SMTP_HOST:
+        print(f"[DEV] Would email invoice for order {order['id']} to {to_email} (SMTP not configured)")
+        return
+
+    from_addr = SMTP_FROM or SMTP_USER
+
+    try:
+        msg = MIMEMultipart()
+        msg["Subject"] = f"Your invoice for order #{order['id']} — {store.get('name', 'Store')}"
+        msg["From"]    = from_addr
+        msg["To"]      = to_email
+
+        body = (
+            f"Hi {order.get('customer_name', '')},\n\n"
+            f"Thank you for your order from {store.get('name', 'our store')}!\n"
+            f"Your order #{order['id']} has been confirmed. Please find your "
+            f"GST invoice attached.\n\n"
+            f"Order total: Rs. {order['total']:.2f}\n\n"
+            f"— {store.get('name', 'Store')}"
+        )
+        msg.attach(MIMEText(body, "plain"))
+
+        with open(pdf_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition",
+            f"attachment; filename=invoice_{order['id']}.pdf",
+        )
+        msg.attach(part)
+
+        with smtplib.SMTP_SSL(SMTP_HOST, 465) as server:
+            server.ehlo()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(from_addr, [to_email], msg.as_string())
+
+        print(f"[invoice] Email sent to {to_email} for order {order['id']}")
+
+    except Exception as e:
+        print(f"[invoice] SMTP send failed for order {order['id']}: {e}")
+        raise
+
+
 # ─── Store Endpoints ─────────────────────────────────────────────
 # ─── KYC Models ──────────────────────────────────────────────────
 class GSTINRequest(BaseModel):
-    gstin: str                  # frontend sends lowercase "gstin"
+    gstin: str  # frontend sends lowercase "gstin"
 
-    model_config = {"extra": "allow"}   # ignore any extra fields silently
+    model_config = {"extra": "allow"}  # ignore any extra fields silently
+
 
 class CINRequest(BaseModel):
     cin: str
@@ -2476,15 +2958,18 @@ class CINRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+
 class SendOTPRequest(BaseModel):
     email: str
     otp: str
 
     model_config = {"extra": "allow"}
 
+
 # ─── Validation error handler → readable JSON instead of raw 422 ──
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
@@ -2498,6 +2983,7 @@ async def validation_exception_handler(request, exc):
         content={"detail": detail, "raw_errors": errors},
     )
 
+
 # ═══════════════════════════════════════════════════════════════════
 #  KYC ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
@@ -2510,49 +2996,38 @@ async def verify_gstin(req: GSTINRequest):
         raise HTTPException(status_code=400, detail="GSTIN must be exactly 15 characters")
 
     # Dev / mock mode
-    if not CASHFREE_CLIENT_ID or not CASHFREE_CLIENT_SECRET:
-        print(f"[DEV] Mock GSTIN lookup for: {gstin_val}")
-        return {"gstin": gstin_val, "business_name": "SAMPLE BUSINESS PVT LTD", "status": "VALID"}
+    # if not RAPIDAPI_KEY:
+    #     print(f"[DEV] Mock GSTIN lookup for: {gstin_val}")
+    #     return {"gstin": gstin_val, "business_name": "SAMPLE BUSINESS PVT LTD", "status": "VALID"}
 
-    # Live Cashfree call — correct headers per Cashfree docs
+    # Live RapidAPI (GST Insights) call
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            res = await client.post(
-                f"{CASHFREE_BASE_URL}/gstin",
-                json={"GSTIN": gstin_val, "business_name": ""},
+            res = await client.get(
+                f"https://gst-insights-api.p.rapidapi.com/getGSTStatus/{gstin_val}",
                 headers={
-                    "x-client-id": CASHFREE_CLIENT_ID,
-                    "x-client-secret": CASHFREE_CLIENT_SECRET,
-                    "x-api-version": "2023-08-01",
+                    "x-rapidapi-key": os.getenv("RAPID_KEY"),
+                    "x-rapidapi-host": "gst-insights-api.p.rapidapi.com",
                     "Content-Type": "application/json",
-                    "Accept": "application/json",
                 },
             )
             data = res.json()
     except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Cashfree unreachable: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"RapidAPI unreachable: {str(e)}")
 
-    print(f"[Cashfree GSTIN] status={res.status_code} body={data}")
+    print(f"[RapidAPI GSTIN] status={res.status_code} body={data}")
 
     if res.status_code != 200:
-        msg = data.get("message") or data.get("error") or f"Cashfree error {res.status_code}"
+        msg = data.get("message") or data.get("error") or f"RapidAPI error {res.status_code}"
         raise HTTPException(status_code=400, detail=msg)
 
-    # Response shape varies — check all known nested locations
-    gstin_data = data.get("gstin_data") or data.get("data") or data
-    business_name = (
-        gstin_data.get("legal_name_of_business")
-        or gstin_data.get("business_name")
-        or gstin_data.get("legalNameOfBusiness")
-        or gstin_data.get("legal_name")
-        or gstin_data.get("trade_name")
-        or data.get("legal_name_of_business")
-        or data.get("business_name")
-        or ""
-    )
+    gst_data = data.get("data") or data
 
-    cf_status = str(gstin_data.get("status") or data.get("status") or "").upper()
-    if cf_status == "INVALID":
+    business_name = gst_data.get("legalName") or ""
+    is_active = gst_data.get("isActive")
+    cf_status = str(gst_data.get("status") or "").upper()
+
+    if not business_name or (is_active is False) or cf_status == "INACTIVE":
         raise HTTPException(status_code=400, detail="GSTIN is invalid or not registered")
 
     return {"gstin": gstin_val, "business_name": business_name, "status": "VALID"}
@@ -2562,7 +3037,7 @@ def _decode_cloudflare_email(hex_string: str) -> str:
     try:
         xor_key = int(hex_string[:2], 16)
         return "".join(
-            chr(int(hex_string[i:i+2], 16) ^ xor_key)
+            chr(int(hex_string[i:i + 2], 16) ^ xor_key)
             for i in range(2, len(hex_string), 2)
         )
     except Exception:
@@ -2649,6 +3124,7 @@ def verify_cin(req: CINRequest):
     if company_name and page_company:
         def _norm(s):
             return re.sub(r"[^a-z0-9]", "", s.lower())
+
         # Accept if either name contains the other (handles abbreviations)
         if _norm(company_name) not in _norm(page_company) and _norm(page_company) not in _norm(company_name):
             raise HTTPException(
@@ -2702,6 +3178,23 @@ def send_otp_email(req: SendOTPRequest):
 
 
 # ─── Store Endpoints ─────────────────────────────────────────────
+
+class Store(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    owner: Optional[str] = ""
+    gstin: Optional[str] = ""  # store's GSTIN, set during KYC — used for GST invoices
+    address: Optional[str] = ""  # registered business address, shown on invoice
+
+
+class StoreUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    owner: Optional[str] = None
+    gstin: Optional[str] = None
+    address: Optional[str] = None
+
+
 @app.post("/stores")
 def create_store(store: Store):
     store_id = str(uuid.uuid4())[:8]
@@ -2710,6 +3203,8 @@ def create_store(store: Store):
         "name": store.name,
         "description": store.description,
         "owner": store.owner,
+        "gstin": store.gstin,
+        "address": store.address,
         "theme": {},
         "hero_text": f"Welcome to {store.name}",
         "hero_subtitle": store.description,
@@ -2718,15 +3213,18 @@ def create_store(store: Store):
     }
     return stores[store_id]
 
+
 @app.get("/stores")
 def list_stores():
     return list(stores.values())
+
 
 @app.get("/stores/{store_id}")
 def get_store(store_id: str):
     if store_id not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
     return stores[store_id]
+
 
 @app.put("/stores/{store_id}")
 def update_store(store_id: str, update: StoreUpdate):
@@ -2736,6 +3234,7 @@ def update_store(store_id: str, update: StoreUpdate):
         stores[store_id][k] = v
     return stores[store_id]
 
+
 @app.delete("/stores/{store_id}")
 def delete_store(store_id: str):
     if store_id not in stores:
@@ -2743,7 +3242,34 @@ def delete_store(store_id: str):
     del stores[store_id]
     return {"message": "Store deleted"}
 
+
 # ─── Product Endpoints ────────────────────────────────────────────
+
+class Product(BaseModel):
+    store_id: str
+    name: str
+    description: Optional[str] = ""
+    price: float
+    stock: int = 0
+    category: Optional[str] = ""
+    image_url: Optional[str] = ""
+    images: Optional[List[str]] = []
+    hsn_code: Optional[str] = ""
+    gst_rate: Optional[float] = 18.0  # GST % for this product (5/12/18/28 etc.)
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    stock: Optional[int] = None
+    category: Optional[str] = None
+    image_url: Optional[str] = None
+    images: Optional[List[str]] = None
+    hsn_code: Optional[str] = None
+    gst_rate: Optional[float] = None
+
+
 @app.post("/products")
 def create_product(product: Product):
     if product.store_id not in stores:
@@ -2756,6 +3282,7 @@ def create_product(product: Product):
     }
     return products[product_id]
 
+
 @app.get("/products")
 def list_products(store_id: Optional[str] = None):
     all_products = list(products.values())
@@ -2763,11 +3290,13 @@ def list_products(store_id: Optional[str] = None):
         all_products = [p for p in all_products if p["store_id"] == store_id]
     return all_products
 
+
 @app.get("/products/{product_id}")
 def get_product(product_id: str):
     if product_id not in products:
         raise HTTPException(status_code=404, detail="Product not found")
     return products[product_id]
+
 
 @app.put("/products/{product_id}")
 def update_product(product_id: str, update: ProductUpdate):
@@ -2777,12 +3306,14 @@ def update_product(product_id: str, update: ProductUpdate):
         products[product_id][k] = v
     return products[product_id]
 
+
 @app.delete("/products/{product_id}")
 def delete_product(product_id: str):
     if product_id not in products:
         raise HTTPException(status_code=404, detail="Product not found")
     del products[product_id]
     return {"message": "Product deleted"}
+
 
 # ─── Order Endpoints ──────────────────────────────────────────────
 @app.post("/orders")
@@ -2807,6 +3338,8 @@ def create_order(order: Order):
             "quantity": item.quantity,
             "unit_price": product["price"],
             "subtotal": subtotal,
+            "hsn_code": product.get("hsn_code", ""),
+            "gst_rate": product.get("gst_rate", 18.0),
         })
     orders[order_id] = {
         "id": order_id,
@@ -2821,12 +3354,14 @@ def create_order(order: Order):
     }
     return orders[order_id]
 
+
 @app.get("/orders")
 def list_orders(store_id: Optional[str] = None):
     all_orders = list(orders.values())
     if store_id:
         all_orders = [o for o in all_orders if o["store_id"] == store_id]
     return all_orders
+
 
 # ─── Review Endpoints ─────────────────────────────────────────────
 @app.post("/reviewz")
@@ -2841,12 +3376,14 @@ def create_review(review: Review):
     }
     return reviews[review_id]
 
+
 @app.get("/reviewz")
 def list_reviews(store_id: Optional[str] = None):
     all_reviews = list(reviews.values())
     if store_id:
         all_reviews = [r for r in all_reviews if r["store_id"] == store_id]
     return all_reviews
+
 
 @app.get("/reviewz/stats/{store_id}")
 def review_stats(store_id: str):
@@ -2861,16 +3398,17 @@ def review_stats(store_id: str):
         "rating_breakdown": breakdown,
     }
 
+
 # ─── Analytics ────────────────────────────────────────────────────
 @app.get("/analytics/{store_id}")
 def get_analytics(store_id: str):
     if store_id not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
-    store_orders   = [o for o in orders.values() if o["store_id"] == store_id]
+    store_orders = [o for o in orders.values() if o["store_id"] == store_id]
     store_products = [p for p in products.values() if p["store_id"] == store_id]
-    store_reviews  = [r for r in reviews.values() if r["store_id"] == store_id]
-    total_revenue  = sum(o["total"] for o in store_orders)
-    avg_rating     = (sum(r["rating"] for r in store_reviews) / len(store_reviews)) if store_reviews else 0
+    store_reviews = [r for r in reviews.values() if r["store_id"] == store_id]
+    total_revenue = sum(o["total"] for o in store_orders)
+    avg_rating = (sum(r["rating"] for r in store_reviews) / len(store_reviews)) if store_reviews else 0
     return {
         "total_orders": len(store_orders),
         "total_revenue": round(total_revenue, 2),
@@ -2887,8 +3425,10 @@ def get_analytics(store_id: str):
 
 razorpay_connections = {}
 
+
 class RazorpayConnection(BaseModel):
     key_id: str
+
 
 class RazorpayOrderRequest(BaseModel):
     store_id: str
@@ -2897,7 +3437,11 @@ class RazorpayOrderRequest(BaseModel):
     customer_email: str
     customer_phone: Optional[str] = ""
     address: Optional[str] = ""
+    delivery_city: Optional[str] = ""
+    delivery_state: Optional[str] = ""  # needed to decide CGST/SGST vs IGST
+    delivery_pincode: Optional[str] = ""
     items: List[OrderItem]
+
 
 @app.get("/razorpay/connection/{store_id}")
 def get_razorpay_connection(store_id: str):
@@ -2906,18 +3450,21 @@ def get_razorpay_connection(store_id: str):
         return {"connected": False}
     return {"connected": True, "key_id": conn["key_id"]}
 
+
 @app.put("/razorpay/connection/{store_id}")
 def upsert_razorpay_connection(store_id: str, payload: RazorpayConnection):
     razorpay_connections[store_id] = {
-        "key_id":       payload.key_id,
+        "key_id": payload.key_id,
         "connected_at": datetime.now().isoformat(),
     }
     return {"connected": True, "key_id": payload.key_id}
+
 
 @app.delete("/razorpay/connection/{store_id}")
 def delete_razorpay_connection(store_id: str):
     razorpay_connections.pop(store_id, None)
     return {"disconnected": True}
+
 
 @app.post("/orders/razorpay")
 def create_razorpay_order(req: RazorpayOrderRequest):
@@ -2926,8 +3473,8 @@ def create_razorpay_order(req: RazorpayOrderRequest):
     if req.store_id not in razorpay_connections:
         raise HTTPException(status_code=400, detail="Razorpay not connected for this store")
 
-    order_id   = str(uuid.uuid4())[:8]
-    total      = 0.0
+    order_id = str(uuid.uuid4())[:8]
+    total = 0.0
     line_items = []
     for item in req.items:
         p = products.get(item.product_id)
@@ -2936,33 +3483,73 @@ def create_razorpay_order(req: RazorpayOrderRequest):
         if p["stock"] < item.quantity:
             raise HTTPException(status_code=400, detail=f"Insufficient stock for {p['name']}")
         subtotal = p["price"] * item.quantity
-        total   += subtotal
+        total += subtotal
         products[item.product_id]["stock"] -= item.quantity
         line_items.append({
-            "product_id":   item.product_id,
+            "product_id": item.product_id,
             "product_name": p["name"],
-            "quantity":     item.quantity,
-            "unit_price":   p["price"],
-            "subtotal":     subtotal,
+            "quantity": item.quantity,
+            "unit_price": p["price"],
+            "subtotal": subtotal,
+            "hsn_code": p.get("hsn_code", ""),  # snapshot at purchase time
+            "gst_rate": p.get("gst_rate", 18.0),  # snapshot at purchase time
         })
 
     orders[order_id] = {
-        "id":             order_id,
-        "store_id":       req.store_id,
-        "customer_name":  req.customer_name,
+        "id": order_id,
+        "store_id": req.store_id,
+        "customer_name": req.customer_name,
         "customer_email": req.customer_email,
-        "address":        req.address,
-        "items":          line_items,
-        "total":          round(total, 2),
-        "status":         "confirmed",
+        "customer_phone": req.customer_phone,
+        "address": req.address,
+        "delivery_city": req.delivery_city,
+        "delivery_state": req.delivery_state,
+        "delivery_pincode": req.delivery_pincode,
+        "items": line_items,
+        "total": round(total, 2),
+        "status": "confirmed",
         "payment_method": "razorpay",
         "razorpay_payment_id": req.payment_id,
-        "created_at":     datetime.now().isoformat(),
+        "created_at": datetime.now().isoformat(),
     }
+
+    # ── Generate the GST invoice and email it to the customer ──────
+    # Wrapped in try/except so a PDF or SMTP failure never blocks the
+    # order confirmation itself — the customer can always re-download
+    # the invoice later via GET /orders/{order_id}/invoice, which
+    # regenerates it fresh on demand.
+    try:
+        store = stores[req.store_id]
+        pdf_path = build_invoice_for_order(orders[order_id], store)
+        orders[order_id]["invoice_path"] = pdf_path
+        send_invoice_email(orders[order_id], store, pdf_path)
+    except Exception as e:
+        print(f"[invoice] Failed to generate/send invoice for order {order_id}: {e}")
+
     return orders[order_id]
 
 
+@app.get("/orders/{order_id}/invoice")
+def download_invoice(order_id: str):
+    """On-demand GST invoice download — also used by the 'Download
+    Invoice' button on the Cart success screen in the frontend."""
+    if order_id not in orders:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order = orders[order_id]
+    store = stores.get(order["store_id"])
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    pdf_path = build_invoice_for_order(order, store)
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"invoice_{order_id}.pdf",
+    )
+
+
 from fastapi.exceptions import RequestValidationError
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -2973,9 +3560,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": exc.errors(), "body_received": body.decode()},
     )
 
+
 # ── In-memory store (replace with your DB layer) ──────────────────────────────
 chatbot_configs: dict = {}
-razorpay_keys: dict   = {}
+razorpay_keys: dict = {}
 return_complaints: dict = {}
 
 
