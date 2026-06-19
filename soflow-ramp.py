@@ -98,6 +98,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+
 # ── Environment ───────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
@@ -2932,8 +2937,54 @@ def send_invoice_email(order: dict, store: dict, pdf_path: str):
         )
         msg.attach(part)
 
-        with smtplib.SMTP_SSL(SMTP_HOST, 465) as server:
-            server.ehlo()
+        with smtplib.SMTP('mail.privateemail.com', 587) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(from_addr, [to_email], msg.as_string())
+
+        print(f"[invoice] Email sent to {to_email} for order {order['id']}")
+
+    except Exception as e:
+        print(f"[invoice] SMTP send failed for order {order['id']}: {e}")
+
+    to_email = order.get("customer_email")
+    if not to_email:
+        return
+
+    if not SMTP_USER or not SMTP_PASSWORD or not SMTP_HOST:
+        print(f"[DEV] Would email invoice for order {order['id']} to {to_email} (SMTP not configured)")
+        return
+
+    from_addr = SMTP_FROM or SMTP_USER
+
+    try:
+        msg = MIMEMultipart()
+        msg["Subject"] = f"Your invoice for order #{order['id']} — {store.get('name', 'Store')}"
+        msg["From"]    = from_addr
+        msg["To"]      = to_email
+
+        body = (
+            f"Hi {order.get('customer_name', '')},\n\n"
+            f"Thank you for your order from {store.get('name', 'our store')}!\n"
+            f"Your order #{order['id']} has been confirmed. Please find your "
+            f"GST invoice attached.\n\n"
+            f"Order total: Rs. {order['total']:.2f}\n\n"
+            f"— {store.get('name', 'Store')}"
+        )
+        msg.attach(MIMEText(body, "plain"))
+
+        with open(pdf_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition",
+            f"attachment; filename=invoice_{order['id']}.pdf",
+        )
+        msg.attach(part)
+
+        with smtplib.SMTP('mail.privateemail.com', 587) as server:
+            server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(from_addr, [to_email], msg.as_string())
 
