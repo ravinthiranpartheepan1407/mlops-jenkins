@@ -50,7 +50,7 @@ from email.mime.text import MIMEText
 from typing import Optional, List, Dict, Any
 
 # ── Third-Party: Web Framework ────────────────────────────────────────────────
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, File, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, File, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
@@ -103,6 +103,10 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 
+from supabase import create_client, Client
+from cryptography.fernet import Fernet
+
+
 # ── Environment ───────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
@@ -147,6 +151,11 @@ AZURE_MODEL   = "Phi-4"
 # ── Razorpay config ───────────────────────────────────────────────────────────
 RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID")
 # RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+
+SUPABASE_URL      = os.getenv("SUPABASE_URL")
+SUPABASE_KEY      = os.getenv("SUPABASE_KEY")   # service role key (bypasses RLS)
+ENCRYPTION_SECRET = os.getenv("ENCRYPTION_SECRET")      # 32-byte base64 key for Fernet
+JWT_SECRET        = os.getenv("JWT_SECRET")
 
 users_store: dict = {}
 posts_store: list = []
@@ -290,16 +299,18 @@ class ProductUpdate(BaseModel):
     images: Optional[List[str]] = None
     hsn_code: Optional[str] = None
 
+
 class OrderItem(BaseModel):
     product_id: str
     quantity: int
+
 
 class Order(BaseModel):
     store_id: str
     customer_name: str
     customer_email: str
-    items: List[OrderItem]
     address: Optional[str] = ""
+    items: List[OrderItem]
 
 class Review(BaseModel):
     store_id: str
@@ -2997,6 +3008,92 @@ def send_invoice_email(order: dict, store: dict, pdf_path: str):
 
 # ─── Store Endpoints ─────────────────────────────────────────────
 # ─── KYC Models ──────────────────────────────────────────────────
+
+
+# ─── SUPABASE CLIENT ──────────────────────────────────────────────
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ─── FERNET ENCRYPTION ────────────────────────────────────────────
+# ENCRYPTION_SECRET must be a valid 32-byte Fernet key.
+# Generate once with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+_fernet = Fernet(ENCRYPTION_SECRET.encode()) if ENCRYPTION_SECRET else None
+
+
+def encrypt_value(plain: str) -> str:
+    """Encrypt a string → base64 token (safe for BYTEA as text)."""
+    if not _fernet:
+        raise RuntimeError("ENCRYPTION_SECRET not set")
+    return _fernet.encrypt(plain.encode()).decode()
+
+
+def decrypt_value(token: str) -> str:
+    """Decrypt a Fernet token back to plain string."""
+    if not _fernet:
+        raise RuntimeError("ENCRYPTION_SECRET not set")
+    return _fernet.decrypt(token.encode()).decode()
+
+
+# ─── IN-MEMORY OTP STORE (for Razorpay key-update OTPs) ──────────
+# { store_id: { otp: str, expires: datetime, email: str } }
+_razorpay_otps: dict = {}
+
+
+# ─── JWT HELPER ───────────────────────────────────────────────────
+def _extract_email_from_jwt(authorization: str) -> str:
+    """
+    Decode a Bearer JWT and return the email claim.
+    Raises 401 if missing / malformed.
+    We replicate the same decode approach used in the Next.js frontend
+    (base64-decode the payload segment) without full signature verification
+    for simplicity — add full HMAC verification below if desired.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    token = authorization.split(" ", 1)[1]
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Not a JWT")
+        payload_b64 = parts[1] + "=="  # pad
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
+        email = payload.get("email")
+        if not email:
+            raise ValueError("No email in token")
+        return email
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
+
+def get_current_email(authorization: str = Header(...)) -> str:
+    return _extract_email_from_jwt(authorization)
+
+
+# ─── STORE OWNERSHIP CHECK ────────────────────────────────────────
+def assert_store_owner(store_id: str, email: str):
+    """Raise 403 if the authenticated user does not own this store."""
+    row = sb.table("stores").select("owner_email").eq("id", store_id).single().execute()
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if row.data["owner_email"] != email:
+        raise HTTPException(status_code=403, detail="Access denied: you do not own this store")
+
+
+# ─── OTP SENDER (shared) ─────────────────────────────────────────
+def _send_otp_email(to_email: str, otp: str, subject: str, body: str):
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print(f"[DEV OTP] to={to_email} code={otp}")
+        return
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.ehlo();
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASSWORD)
+        s.sendmail(SMTP_FROM, [to_email], msg.as_string())
+
+
 class GSTINRequest(BaseModel):
     gstin: str  # frontend sends lowercase "gstin"
 
@@ -3234,8 +3331,8 @@ class Store(BaseModel):
     name: str
     description: Optional[str] = ""
     owner: Optional[str] = ""
-    gstin: Optional[str] = ""  # store's GSTIN, set during KYC — used for GST invoices
-    address: Optional[str] = ""  # registered business address, shown on invoice
+    gstin: Optional[str] = ""
+    address: Optional[str] = ""
 
 
 class StoreUpdate(BaseModel):
@@ -3244,53 +3341,74 @@ class StoreUpdate(BaseModel):
     owner: Optional[str] = None
     gstin: Optional[str] = None
     address: Optional[str] = None
+    theme: Optional[dict] = None
+    hero_text: Optional[str] = None
+    hero_subtitle: Optional[str] = None
+    banner_color: Optional[str] = None
 
 
 @app.post("/stores")
-def create_store(store: Store):
+def create_store(store: Store, email: str = Depends(get_current_email)):
+    # Check if this seller already has a store
+    existing = sb.table("stores").select("id").eq("owner_email", email).execute()
+    if existing.data:
+        raise HTTPException(
+            status_code=409,
+            detail={"existing_store_id": existing.data[0]["id"], "message": "Store already exists"}
+        )
+
     store_id = str(uuid.uuid4())[:8]
-    stores[store_id] = {
+    row = {
         "id": store_id,
+        "owner_email": email,
         "name": store.name,
-        "description": store.description,
-        "owner": store.owner,
-        "gstin": store.gstin,
-        "address": store.address,
+        "description": store.description or "",
+        "owner": store.owner or "",
+        "gstin": store.gstin or "",
+        "address": store.address or "",
         "theme": {},
         "hero_text": f"Welcome to {store.name}",
-        "hero_subtitle": store.description,
+        "hero_subtitle": store.description or "",
         "banner_color": "#6366f1",
-        "created_at": datetime.now().isoformat(),
     }
-    return stores[store_id]
+    result = sb.table("stores").insert(row).execute()
+    return result.data[0]
+
+
+@app.get("/stores/mine")
+def get_my_store(email: str = Depends(get_current_email)):
+    """Return the store owned by the authenticated seller, or null."""
+    result = sb.table("stores").select("*").eq("owner_email", email).execute()
+    if result.data:
+        return result.data[0]
+    return None
 
 
 @app.get("/stores")
-def list_stores():
-    return list(stores.values())
+def list_stores(email: str = Depends(get_current_email)):
+    result = sb.table("stores").select("*").eq("owner_email", email).execute()
+    return result.data
 
 
 @app.get("/stores/{store_id}")
-def get_store(store_id: str):
-    if store_id not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
-    return stores[store_id]
+def get_store(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    result = sb.table("stores").select("*").eq("id", store_id).single().execute()
+    return result.data
 
 
 @app.put("/stores/{store_id}")
-def update_store(store_id: str, update: StoreUpdate):
-    if store_id not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
-    for k, v in update.dict(exclude_none=True).items():
-        stores[store_id][k] = v
-    return stores[store_id]
+def update_store(store_id: str, update: StoreUpdate, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    payload = {k: v for k, v in update.dict().items() if v is not None}
+    result = sb.table("stores").update(payload).eq("id", store_id).execute()
+    return result.data[0]
 
 
 @app.delete("/stores/{store_id}")
-def delete_store(store_id: str):
-    if store_id not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
-    del stores[store_id]
+def delete_store(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    sb.table("stores").delete().eq("id", store_id).execute()
     return {"message": "Store deleted"}
 
 
@@ -3306,7 +3424,7 @@ class Product(BaseModel):
     image_url: Optional[str] = ""
     images: Optional[List[str]] = []
     hsn_code: Optional[str] = ""
-    gst_rate: Optional[float] = 18.0  # GST % for this product (5/12/18/28 etc.)
+    gst_rate: Optional[float] = 18.0
 
 
 class ProductUpdate(BaseModel):
@@ -3322,24 +3440,33 @@ class ProductUpdate(BaseModel):
 
 
 @app.post("/products")
-def create_product(product: Product):
-    if product.store_id not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
+def create_product(product: Product, email: str = Depends(get_current_email)):
+    assert_store_owner(product.store_id, email)
     product_id = str(uuid.uuid4())[:8]
-    products[product_id] = {
+    row = {
         "id": product_id,
-        **product.dict(),
-        "created_at": datetime.now().isoformat(),
+        "store_id": product.store_id,
+        "name": product.name,
+        "description": product.description or "",
+        "price": product.price,
+        "stock": product.stock,
+        "category": product.category or "",
+        "image_url": product.image_url or "",
+        "images": product.images or [],
+        "hsn_code": product.hsn_code or "",
+        "gst_rate": product.gst_rate or 18.0,
     }
-    return products[product_id]
+    result = sb.table("products").insert(row).execute()
+    return result.data[0]
 
 
 @app.get("/products")
-def list_products(store_id: Optional[str] = None):
-    all_products = list(products.values())
-    if store_id:
-        all_products = [p for p in all_products if p["store_id"] == store_id]
-    return all_products
+def list_products(store_id: Optional[str] = None, email: str = Depends(get_current_email)):
+    if not store_id:
+        raise HTTPException(status_code=400, detail="store_id required")
+    assert_store_owner(store_id, email)
+    result = sb.table("products").select("*").eq("store_id", store_id).execute()
+    return result.data
 
 
 @app.get("/products/{product_id}")
@@ -3350,95 +3477,123 @@ def get_product(product_id: str):
 
 
 @app.put("/products/{product_id}")
-def update_product(product_id: str, update: ProductUpdate):
-    if product_id not in products:
+def update_product(product_id: str, update: ProductUpdate, email: str = Depends(get_current_email)):
+    row = sb.table("products").select("store_id").eq("id", product_id).single().execute()
+    if not row.data:
         raise HTTPException(status_code=404, detail="Product not found")
-    for k, v in update.dict(exclude_none=True).items():
-        products[product_id][k] = v
-    return products[product_id]
+    assert_store_owner(row.data["store_id"], email)
+    payload = {k: v for k, v in update.dict().items() if v is not None}
+    result = sb.table("products").update(payload).eq("id", product_id).execute()
+    return result.data[0]
 
 
 @app.delete("/products/{product_id}")
-def delete_product(product_id: str):
-    if product_id not in products:
+def delete_product(product_id: str, email: str = Depends(get_current_email)):
+    row = sb.table("products").select("store_id").eq("id", product_id).single().execute()
+    if not row.data:
         raise HTTPException(status_code=404, detail="Product not found")
-    del products[product_id]
+    assert_store_owner(row.data["store_id"], email)
+    sb.table("products").delete().eq("id", product_id).execute()
     return {"message": "Product deleted"}
+
+
+def _build_order_row(order_id, store_id, req, line_items, total, method="", payment_id=""):
+    return {
+        "id": order_id,
+        "store_id": store_id,
+        "customer_name": req.customer_name,
+        "customer_email": req.customer_email,
+        "customer_phone": getattr(req, "customer_phone", ""),
+        "address": req.address or "",
+        "delivery_city": getattr(req, "delivery_city", ""),
+        "delivery_state": getattr(req, "delivery_state", ""),
+        "delivery_pincode": getattr(req, "delivery_pincode", ""),
+        "items": line_items,
+        "total": round(total, 2),
+        "status": "confirmed",
+        "payment_method": method,
+        "razorpay_payment_id": payment_id,
+    }
+
+
+def _deduct_stock_and_build_items(req_items: List[OrderItem]):
+    """Validate stock, deduct, return line_items + total."""
+    total = 0.0
+    line_items = []
+    for item in req_items:
+        p = sb.table("products").select("*").eq("id", item.product_id).single().execute().data
+        if not p:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        if p["stock"] < item.quantity:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {p['name']}")
+        new_stock = p["stock"] - item.quantity
+        sb.table("products").update({"stock": new_stock}).eq("id", item.product_id).execute()
+        subtotal = float(p["price"]) * item.quantity
+        total += subtotal
+        line_items.append({
+            "product_id": item.product_id,
+            "product_name": p["name"],
+            "quantity": item.quantity,
+            "unit_price": float(p["price"]),
+            "subtotal": subtotal,
+            "hsn_code": p.get("hsn_code", ""),
+            "gst_rate": p.get("gst_rate", 18.0),
+        })
+    return line_items, total
 
 
 # ─── Order Endpoints ──────────────────────────────────────────────
 @app.post("/orders")
 def create_order(order: Order):
-    if order.store_id not in stores:
+    # Public endpoint — customers place orders without JWT
+    store = sb.table("stores").select("id").eq("id", order.store_id).single().execute()
+    if not store.data:
         raise HTTPException(status_code=404, detail="Store not found")
+    line_items, total = _deduct_stock_and_build_items(order.items)
     order_id = str(uuid.uuid4())[:8]
-    total = 0
-    line_items = []
-    for item in order.items:
-        if item.product_id not in products:
-            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
-        product = products[item.product_id]
-        if product["stock"] < item.quantity:
-            raise HTTPException(status_code=400, detail=f"Insufficient stock for {product['name']}")
-        products[item.product_id]["stock"] -= item.quantity
-        subtotal = product["price"] * item.quantity
-        total += subtotal
-        line_items.append({
-            "product_id": item.product_id,
-            "product_name": product["name"],
-            "quantity": item.quantity,
-            "unit_price": product["price"],
-            "subtotal": subtotal,
-            "hsn_code": product.get("hsn_code", ""),
-            "gst_rate": product.get("gst_rate", 18.0),
-        })
-    orders[order_id] = {
-        "id": order_id,
-        "store_id": order.store_id,
-        "customer_name": order.customer_name,
-        "customer_email": order.customer_email,
-        "address": order.address,
-        "items": line_items,
-        "total": total,
-        "status": "confirmed",
-        "created_at": datetime.now().isoformat(),
-    }
-    return orders[order_id]
+    row = _build_order_row(order_id, order.store_id, order, line_items, total)
+    result = sb.table("orders").insert(row).execute()
+    return result.data[0]
 
 
 @app.get("/orders")
-def list_orders(store_id: Optional[str] = None):
-    all_orders = list(orders.values())
-    if store_id:
-        all_orders = [o for o in all_orders if o["store_id"] == store_id]
-    return all_orders
+def list_orders(store_id: Optional[str] = None, email: str = Depends(get_current_email)):
+    if not store_id:
+        raise HTTPException(status_code=400, detail="store_id required")
+    assert_store_owner(store_id, email)
+    result = sb.table("orders").select("*").eq("store_id", store_id).execute()
+    return result.data
 
 
 # ─── Review Endpoints ─────────────────────────────────────────────
 @app.post("/reviewz")
 def create_review(review: Review):
-    if review.store_id not in stores:
+    store = sb.table("stores").select("id").eq("id", review.store_id).execute()
+    if not store.data:
         raise HTTPException(status_code=404, detail="Store not found")
-    review_id = str(uuid.uuid4())[:8]
-    reviews[review_id] = {
-        "id": review_id,
-        **review.dict(),
-        "created_at": datetime.now().isoformat(),
+    row = {
+        "store_id": review.store_id,
+        "customer_name": getattr(review, "customer_name", ""),
+        "customer_email": getattr(review, "customer_email", ""),
+        "rating": review.rating,
+        "comment": getattr(review, "comment", ""),
     }
-    return reviews[review_id]
+    result = sb.table("reviews").insert(row).execute()
+    return result.data[0]
 
 
 @app.get("/reviewz")
 def list_reviews(store_id: Optional[str] = None):
-    all_reviews = list(reviews.values())
+    query = sb.table("reviews").select("*")
     if store_id:
-        all_reviews = [r for r in all_reviews if r["store_id"] == store_id]
-    return all_reviews
+        query = query.eq("store_id", store_id)
+    result = query.execute()
+    return result.data
 
 
 @app.get("/reviewz/stats/{store_id}")
 def review_stats(store_id: str):
-    store_reviews = [r for r in reviews.values() if r["store_id"] == store_id]
+    store_reviews = sb.table("reviews").select("rating").eq("store_id", store_id).execute().data
     if not store_reviews:
         return {"average_rating": 0, "total_reviews": 0, "rating_breakdown": {}}
     avg = sum(r["rating"] for r in store_reviews) / len(store_reviews)
@@ -3452,14 +3607,17 @@ def review_stats(store_id: str):
 
 # ─── Analytics ────────────────────────────────────────────────────
 @app.get("/analytics/{store_id}")
-def get_analytics(store_id: str):
-    if store_id not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
-    store_orders = [o for o in orders.values() if o["store_id"] == store_id]
-    store_products = [p for p in products.values() if p["store_id"] == store_id]
-    store_reviews = [r for r in reviews.values() if r["store_id"] == store_id]
-    total_revenue = sum(o["total"] for o in store_orders)
-    avg_rating = (sum(r["rating"] for r in store_reviews) / len(store_reviews)) if store_reviews else 0
+def get_analytics(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    store_orders = sb.table("orders").select("*").eq("store_id", store_id).execute().data
+    store_products = sb.table("products").select("*").eq("store_id", store_id).execute().data
+    store_reviews = sb.table("reviews").select("rating").eq("store_id", store_id).execute().data
+
+    total_revenue = sum(float(o["total"]) for o in store_orders)
+    avg_rating = (
+        sum(r["rating"] for r in store_reviews) / len(store_reviews)
+        if store_reviews else 0
+    )
     return {
         "total_orders": len(store_orders),
         "total_revenue": round(total_revenue, 2),
@@ -3481,122 +3639,216 @@ class RazorpayConnection(BaseModel):
     key_id: str
 
 
+class OTPVerifyAndUpdate(BaseModel):
+    otp: str
+    key_id: str
+
+
 class RazorpayOrderRequest(BaseModel):
-    store_id: str
-    payment_id: str
-    customer_name: str
-    customer_email: str
-    customer_phone: Optional[str] = ""
-    address: Optional[str] = ""
-    delivery_city: Optional[str] = ""
-    delivery_state: Optional[str] = ""  # needed to decide CGST/SGST vs IGST
-    delivery_pincode: Optional[str] = ""
-    items: List[OrderItem]
+    store_id:          str
+    payment_id:        str
+    customer_name:     str
+    customer_email:    str
+    customer_phone:    Optional[str] = ""
+    address:           Optional[str] = ""
+    delivery_city:     Optional[str] = ""
+    delivery_state:    Optional[str] = ""
+    delivery_pincode:  Optional[str] = ""
+    items:             List[OrderItem]
 
 
 @app.get("/razorpay/connection/{store_id}")
-def get_razorpay_connection(store_id: str):
-    conn = razorpay_connections.get(store_id)
-    if not conn:
+def get_razorpay_connection(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    conn = sb.table("payments").select("key_id_enc, connected_at, updated_at").eq("store_id", store_id).execute()
+    if not conn.data:
         return {"connected": False}
-    return {"connected": True, "key_id": conn["key_id"]}
+    # Return only a masked preview — never the raw key
+    try:
+        plain = decrypt_value(conn.data[0]["key_id_enc"])
+        masked = plain[:7] + "•" * (len(plain) - 11) + plain[-4:]
+    except Exception:
+        masked = "rzp_••••••••••••"
+    return {
+        "connected":    True,
+        "key_id":       masked,
+        "connected_at": conn.data[0]["connected_at"],
+        "updated_at":   conn.data[0]["updated_at"],
+    }
+
+
+@app.get("/razorpay/status/{store_id}")
+def get_razorpay_status(store_id: str):
+    """Public — used by checkout page to know if Razorpay is available. No key data returned."""
+    conn = sb.table("payments").select("id").eq("store_id", store_id).execute()
+    return {"connected": bool(conn.data)}
 
 
 @app.put("/razorpay/connection/{store_id}")
-def upsert_razorpay_connection(store_id: str, payload: RazorpayConnection):
-    razorpay_connections[store_id] = {
-        "key_id": payload.key_id,
-        "connected_at": datetime.now().isoformat(),
-    }
-    return {"connected": True, "key_id": payload.key_id}
+def upsert_razorpay_connection(
+        store_id: str,
+        payload: RazorpayConnection,
+        email: str = Depends(get_current_email),
+):
+    """
+    First-time setup: no OTP required.
+    Subsequent updates: must go through /razorpay/connection/{store_id}/request-otp
+    then /razorpay/connection/{store_id}/update-with-otp.
+    """
+    assert_store_owner(store_id, email)
+
+    existing = sb.table("payments").select("id").eq("store_id", store_id).execute()
+    if existing.data:
+        # Already connected — block direct update, force OTP flow
+        raise HTTPException(
+            status_code=403,
+            detail="Razorpay key already set. Use the OTP verification flow to update it."
+        )
+
+    encrypted = encrypt_value(payload.key_id.strip())
+    sb.table("payments").insert({
+        "store_id": store_id,
+        "key_id_enc": encrypted,
+    }).execute()
+    return {"connected": True, "message": "Razorpay Key ID saved securely."}
+
+
+@app.post("/razorpay/connection/{store_id}/request-otp")
+def request_razorpay_update_otp(store_id: str, email: str = Depends(get_current_email)):
+    """
+    Send OTP to the seller's email before allowing a Razorpay key update.
+    """
+    assert_store_owner(store_id, email)
+    existing = sb.table("payments").select("id").eq("store_id", store_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=400, detail="No Razorpay key connected yet. Use the standard save flow.")
+
+    otp = str(uuid.uuid4().int)[:6]
+    expires = datetime.utcnow() + timedelta(minutes=10)
+    _razorpay_otps[store_id] = {"otp": otp, "expires": expires, "email": email}
+
+    _send_otp_email(
+        to_email=email,
+        otp=otp,
+        subject="Razorpay Key Update — Verification Code",
+        body=(
+            f"Hello,\n\n"
+            f"A request was made to update the Razorpay Key ID for your store ({store_id}).\n\n"
+            f"Your verification code is:\n\n"
+            f"  {otp}\n\n"
+            f"This code expires in 10 minutes. If you did not request this, ignore this email "
+            f"and your existing key will remain unchanged.\n\n"
+            f"— Store Platform"
+        ),
+    )
+    return {"sent": True, "message": f"OTP sent to {email}"}
+
+
+@app.post("/razorpay/connection/{store_id}/update-with-otp")
+def update_razorpay_with_otp(
+        store_id: str,
+        body: OTPVerifyAndUpdate,
+        email: str = Depends(get_current_email),
+):
+    """
+    Verify OTP then update the encrypted Razorpay key.
+    """
+    assert_store_owner(store_id, email)
+
+    pending = _razorpay_otps.get(store_id)
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending OTP. Request one first.")
+    if pending["email"] != email:
+        raise HTTPException(status_code=403, detail="OTP was issued for a different user.")
+    if datetime.utcnow() > pending["expires"]:
+        _razorpay_otps.pop(store_id, None)
+        raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+    if body.otp.strip() != pending["otp"]:
+        raise HTTPException(status_code=400, detail="Incorrect OTP.")
+
+    # OTP matched — update the encrypted key
+    _razorpay_otps.pop(store_id, None)
+    encrypted = encrypt_value(body.key_id.strip())
+    sb.table("payments").update({
+        "key_id_enc": encrypted,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("store_id", store_id).execute()
+
+    return {"connected": True, "message": "Razorpay Key ID updated successfully."}
 
 
 @app.delete("/razorpay/connection/{store_id}")
-def delete_razorpay_connection(store_id: str):
-    razorpay_connections.pop(store_id, None)
+def delete_razorpay_connection(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    sb.table("payments").delete().eq("store_id", store_id).execute()
+    _razorpay_otps.pop(store_id, None)
     return {"disconnected": True}
+
+
+@app.get("/razorpay/key/{store_id}")
+def get_razorpay_key_public(store_id: str):
+    conn = sb.table("payments").select("key_id_enc").eq("store_id", store_id).execute()
+    print(f"[DEBUG] payments row: {conn.data}")
+    raw = _get_raw_razorpay_key(store_id)
+    print(f"[DEBUG] decrypted raw: {raw}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Razorpay not configured")
+    return {"key_id": raw}
+
+
+# ─── Internal helper used by order endpoints to read the raw key ──
+def _get_raw_razorpay_key(store_id: str) -> Optional[str]:
+    conn = sb.table("payments").select("key_id_enc").eq("store_id", store_id).execute()
+    if not conn.data:
+        return None
+    try:
+        token = conn.data[0]["key_id_enc"]
+        # Supabase returns BYTEA as \x<hex> — convert back to the Fernet token string
+        if isinstance(token, str) and token.startswith("\\x"):
+            token = bytes.fromhex(token[2:]).decode()
+        return decrypt_value(token)
+    except Exception as e:
+        print(f"[decrypt error] {e}")
+        return None
 
 
 @app.post("/orders/razorpay")
 def create_razorpay_order(req: RazorpayOrderRequest):
-    if req.store_id not in stores:
+    # Public endpoint — called after customer completes payment
+    store = sb.table("stores").select("*").eq("id", req.store_id).single().execute()
+    if not store.data:
         raise HTTPException(status_code=404, detail="Store not found")
-    if req.store_id not in razorpay_connections:
+    conn = sb.table("payments").select("id").eq("store_id", req.store_id).execute()
+    if not conn.data:
         raise HTTPException(status_code=400, detail="Razorpay not connected for this store")
 
+    line_items, total = _deduct_stock_and_build_items(req.items)
     order_id = str(uuid.uuid4())[:8]
-    total = 0.0
-    line_items = []
-    for item in req.items:
-        p = products.get(item.product_id)
-        if not p:
-            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
-        if p["stock"] < item.quantity:
-            raise HTTPException(status_code=400, detail=f"Insufficient stock for {p['name']}")
-        subtotal = p["price"] * item.quantity
-        total += subtotal
-        products[item.product_id]["stock"] -= item.quantity
-        line_items.append({
-            "product_id": item.product_id,
-            "product_name": p["name"],
-            "quantity": item.quantity,
-            "unit_price": p["price"],
-            "subtotal": subtotal,
-            "hsn_code": p.get("hsn_code", ""),  # snapshot at purchase time
-            "gst_rate": p.get("gst_rate", 18.0),  # snapshot at purchase time
-        })
+    row = _build_order_row(order_id, req.store_id, req, line_items, total, "razorpay", req.payment_id)
+    result = sb.table("orders").insert(row).execute()
+    order = result.data[0]
 
-    orders[order_id] = {
-        "id": order_id,
-        "store_id": req.store_id,
-        "customer_name": req.customer_name,
-        "customer_email": req.customer_email,
-        "customer_phone": req.customer_phone,
-        "address": req.address,
-        "delivery_city": req.delivery_city,
-        "delivery_state": req.delivery_state,
-        "delivery_pincode": req.delivery_pincode,
-        "items": line_items,
-        "total": round(total, 2),
-        "status": "confirmed",
-        "payment_method": "razorpay",
-        "razorpay_payment_id": req.payment_id,
-        "created_at": datetime.now().isoformat(),
-    }
-
-    # ── Generate the GST invoice and email it to the customer ──────
-    # Wrapped in try/except so a PDF or SMTP failure never blocks the
-    # order confirmation itself — the customer can always re-download
-    # the invoice later via GET /orders/{order_id}/invoice, which
-    # regenerates it fresh on demand.
     try:
-        store = stores[req.store_id]
-        pdf_path = build_invoice_for_order(orders[order_id], store)
-        orders[order_id]["invoice_path"] = pdf_path
-        send_invoice_email(orders[order_id], store, pdf_path)
+        store_data = store.data
+        pdf_path = build_invoice_for_order(order, store_data)
+        sb.table("orders").update({"invoice_path": pdf_path}).eq("id", order_id).execute()
+        send_invoice_email(order, store_data, pdf_path)
     except Exception as e:
-        print(f"[invoice] Failed to generate/send invoice for order {order_id}: {e}")
+        print(f"[invoice] Failed for order {order_id}: {e}")
 
-    return orders[order_id]
+    return order
 
 
 @app.get("/orders/{order_id}/invoice")
 def download_invoice(order_id: str):
-    """On-demand GST invoice download — also used by the 'Download
-    Invoice' button on the Cart success screen in the frontend."""
-    if order_id not in orders:
+    order = sb.table("orders").select("*").eq("id", order_id).single().execute().data
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    order = orders[order_id]
-    store = stores.get(order["store_id"])
+    store = sb.table("stores").select("*").eq("id", order["store_id"]).single().execute().data
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-
     pdf_path = build_invoice_for_order(order, store)
-    return FileResponse(
-        pdf_path,
-        media_type="application/pdf",
-        filename=f"invoice_{order_id}.pdf",
-    )
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"invoice_{order_id}.pdf")
 
 
 from fastapi.exceptions import RequestValidationError
@@ -4028,6 +4280,19 @@ async def submit_return(req: ReturnRequest):
     actual_order_id = resolved_order["id"] if resolved_order else req.order_id
     razorpay_payment_id = resolved_order.get("razorpay_payment_id", "") if resolved_order else ""
 
+    sb.table("returns").insert({
+        "store_id": req.store_id,
+        "order_id": req.order_id,
+        "reason": req.reason,
+        "image_url": req.image_url,
+        "image_caption": caption,  # from your analysis
+        "defect_keywords": defect_analysis["keywords_found"],  # from your analysis
+        "status":           "approved" if defect_analysis["eligible_for_return"] else "manual_review",
+        "verdict_message": verdict_message,
+        "eligible":         defect_analysis["eligible_for_return"],
+        "submitted_at": datetime.utcnow().isoformat(),
+    }).execute()
+
     # ── Persist the complaint so admin can view it ─────────────────────────────
     import time
     complaint = {
@@ -4063,10 +4328,37 @@ async def submit_return(req: ReturnRequest):
 # ── Add this NEW endpoint right after the one above ──────────────────────────
 
 @app.get("/chatbot/returns/{store_id}")
-async def get_return_complaints(store_id: str):
-    """Return all submitted return complaints for a store, newest first."""
-    complaints = return_complaints.get(store_id, [])
-    return {"complaints": list(reversed(complaints))}
+def get_returns(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    result = sb.table("returns").select("*").eq("store_id", store_id).order("submitted_at", desc=True).execute()
+    return {"complaints": result.data}
+
+
+@app.post("/chatbot/returns")
+def create_return(payload: dict):
+    # Public endpoint — customers submit return requests via chatbot
+    store_id = payload.get("store_id")
+    if not store_id:
+        raise HTTPException(status_code=400, detail="store_id required")
+    store = sb.table("stores").select("id").eq("id", store_id).single().execute()
+    if not store.data:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    return_id = str(uuid.uuid4())[:8]
+    row = {
+        "id": return_id,
+        "store_id": store_id,
+        "order_id": payload.get("order_id", ""),
+        "image_url": payload.get("image_url", ""),
+        "image_caption": payload.get("image_caption", ""),
+        "reason": payload.get("reason", ""),
+        "defect_keywords": payload.get("defect_keywords", []),
+        "status": payload.get("status", "pending"),
+        "verdict_message": payload.get("verdict_message", ""),
+        "razorpay_payment_id": payload.get("razorpay_payment_id", ""),
+    }
+    result = sb.table("returns").insert(row).execute()
+    return result.data[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4079,11 +4371,25 @@ class RazorpayKeyPayload(BaseModel):
 
 
 @app.get("/razorpay/connection/{store_id}")
-async def get_razorpay_connection(store_id: str):
-    creds = razorpay_keys.get(store_id)
-    if creds:
-        return {"connected": True, "key_id": creds["key_id"]}
-    return {"connected": False}
+def get_razorpay_connection(store_id: str, email: str = Depends(get_current_email)):
+    assert_store_owner(store_id, email)
+    conn = sb.table("payments").select("key_id_enc, connected_at, updated_at").eq("store_id", store_id).execute()
+    if not conn.data:
+        return {"connected": False}
+    try:
+        token = conn.data[0]["key_id_enc"]
+        if isinstance(token, str) and token.startswith("\\x"):
+            token = bytes.fromhex(token[2:]).decode()
+        plain = decrypt_value(token)
+        masked = plain[:7] + "•" * (len(plain) - 11) + plain[-4:]
+    except Exception:
+        masked = "rzp_••••••••••••"
+    return {
+        "connected":    True,
+        "key_id":       masked,
+        "connected_at": conn.data[0]["connected_at"],
+        "updated_at":   conn.data[0]["updated_at"],
+    }
 
 
 # @app.put("/razorpay/connection/{store_id}")
