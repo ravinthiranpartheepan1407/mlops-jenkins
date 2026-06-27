@@ -267,19 +267,23 @@ class Store(BaseModel):
     name: str
     description: Optional[str] = ""
     owner: Optional[str] = ""
+    gstin: Optional[str] = ""
+    address: Optional[str] = ""
+    business_category: Optional[str] = ""
 
-# If StoreUpdate doesn't include page_config, add it:
+
 class StoreUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     owner: Optional[str] = None
     gstin: Optional[str] = None
     address: Optional[str] = None
+    business_category: Optional[str] = None
     theme: Optional[dict] = None
     hero_text: Optional[str] = None
     hero_subtitle: Optional[str] = None
     banner_color: Optional[str] = None
-    page_config: Optional[str] = None  # ← ADD THIS
+    page_config: Optional[str] = None
 
 
 class Product(BaseModel):
@@ -3371,6 +3375,7 @@ def create_store(store: Store, email: str = Depends(get_current_email)):
         "owner": store.owner or "",
         "gstin": store.gstin or "",
         "address": store.address or "",
+        "business_category": store.business_category or "",
         "theme": {},
         "hero_text": f"Welcome to {store.name}",
         "hero_subtitle": store.description or "",
