@@ -268,15 +268,19 @@ class Store(BaseModel):
     description: Optional[str] = ""
     owner: Optional[str] = ""
 
+# If StoreUpdate doesn't include page_config, add it:
 class StoreUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     owner: Optional[str] = None
+    gstin: Optional[str] = None
+    address: Optional[str] = None
     theme: Optional[dict] = None
     hero_text: Optional[str] = None
     hero_subtitle: Optional[str] = None
     banner_color: Optional[str] = None
-    page_config: Optional[str] = None
+    page_config: Optional[str] = None  # ← ADD THIS
+
 
 class Product(BaseModel):
     store_id: str
@@ -3345,6 +3349,7 @@ class StoreUpdate(BaseModel):
     hero_text: Optional[str] = None
     hero_subtitle: Optional[str] = None
     banner_color: Optional[str] = None
+    page_config: Optional[str] = None  # ← ADD THIS
 
 
 @app.post("/stores")
@@ -3391,9 +3396,10 @@ def list_stores(email: str = Depends(get_current_email)):
 
 
 @app.get("/stores/{store_id}")
-def get_store(store_id: str, email: str = Depends(get_current_email)):
-    assert_store_owner(store_id, email)
+def get_store(store_id: str):
     result = sb.table("stores").select("*").eq("id", store_id).single().execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Store not found")
     return result.data
 
 
@@ -3401,6 +3407,7 @@ def get_store(store_id: str, email: str = Depends(get_current_email)):
 def update_store(store_id: str, update: StoreUpdate, email: str = Depends(get_current_email)):
     assert_store_owner(store_id, email)
     payload = {k: v for k, v in update.dict().items() if v is not None}
+    print(f"[update_store] payload keys: {list(payload.keys())}")  # ← confirm page_config appears
     result = sb.table("stores").update(payload).eq("id", store_id).execute()
     return result.data[0]
 
@@ -3461,19 +3468,35 @@ def create_product(product: Product, email: str = Depends(get_current_email)):
 
 
 @app.get("/products")
-def list_products(store_id: Optional[str] = None, email: str = Depends(get_current_email)):
+def list_products(store_id: Optional[str] = None, authorization: Optional[str] = Header(default=None)):
     if not store_id:
         raise HTTPException(status_code=400, detail="store_id required")
-    assert_store_owner(store_id, email)
+    # Only enforce ownership check if auth header is present (seller dashboard)
+    if authorization:
+        try:
+            email = _extract_email_from_jwt(authorization)
+            assert_store_owner(store_id, email)
+        except HTTPException:
+            raise
+    result = sb.table("products").select("*").eq("store_id", store_id).execute()
+    return result.data
+
+
+
+@app.get("/products/public")
+def list_products_public(store_id: str):
+    if not store_id:
+        raise HTTPException(status_code=400, detail="store_id required")
     result = sb.table("products").select("*").eq("store_id", store_id).execute()
     return result.data
 
 
 @app.get("/products/{product_id}")
 def get_product(product_id: str):
-    if product_id not in products:
+    row = sb.table("products").select("*").eq("id", product_id).single().execute()
+    if not row.data:
         raise HTTPException(status_code=404, detail="Product not found")
-    return products[product_id]
+    return row.data
 
 
 @app.put("/products/{product_id}")
@@ -4041,19 +4064,33 @@ def detect_defects(caption: str) -> dict:
 
 @app.get("/chatbot/config/{store_id}")
 async def get_chatbot_config(store_id: str):
-    """Return the chatbot configuration for a store."""
-    return chatbot_configs.get(store_id, {
+    row = sb.table("chatbot_configs").select("*").eq("store_id", store_id).execute()
+    if row.data:
+        return row.data[0]
+    return {
+        "store_id": store_id,
         "bot_name": "Store Assistant",
         "greeting": "Hi! How can I help you today?",
-        "faqs":     [],
+        "faqs": [],
         "linked_store_id": "",
-    })
+    }
 
 
 @app.put("/chatbot/config/{store_id}")
 async def put_chatbot_config(store_id: str, config: ChatbotConfig):
-    """Save / overwrite chatbot configuration for a store."""
-    chatbot_configs[store_id] = config.model_dump()
+    existing = sb.table("chatbot_configs").select("store_id").eq("store_id", store_id).execute()
+    payload = {
+        "store_id":        store_id,
+        "bot_name":        config.bot_name,
+        "greeting":        config.greeting,
+        "faqs":            [f.model_dump() if hasattr(f, "model_dump") else f for f in (config.faqs or [])],
+        "linked_store_id": config.linked_store_id or "",
+        "updated_at":      datetime.utcnow().isoformat(),
+    }
+    if existing.data:
+        sb.table("chatbot_configs").update(payload).eq("store_id", store_id).execute()
+    else:
+        sb.table("chatbot_configs").insert(payload).execute()
     return {"success": True, "message": "Chatbot configuration saved."}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4062,20 +4099,16 @@ async def put_chatbot_config(store_id: str, config: ChatbotConfig):
 
 @app.post("/chatbot/chat")
 async def chatbot_chat(req: ChatRequest):
-    """
-    1. Try to match against store FAQ knowledge base (strict stopword-aware matching).
-    2. If no FAQ match, call Phi-4 with the full FAQ context so it can reason
-       over the knowledge base and give a helpful, grounded answer.
-    """
-    cfg  = chatbot_configs.get(req.store_id, {})
-    faqs: List[FAQ] = [FAQ(**f) for f in cfg.get("faqs", [])]
+    row = sb.table("chatbot_configs").select("*").eq("store_id", req.store_id).execute()
+    cfg = row.data[0] if row.data else {}
+    faqs: List[FAQ] = [FAQ(**f) for f in (cfg.get("faqs") or [])]
 
-    # ── Step 1: Direct FAQ match (fast path) ──────────────────────────────────
+    # ── Step 1: Direct FAQ match (fast path) ──
     faq_answer = faq_match(faqs, req.message)
     if faq_answer:
         return {"reply": faq_answer, "source": "faq"}
 
-    # ── Step 2: Phi-4 with FAQ knowledge base as context ──────────────────────
+    # ── Step 2: Phi-4 in thread pool (non-blocking) ──
     faq_context = "\n".join(
         f"Q: {f.question}\nA: {f.answer}" for f in faqs
     ) if faqs else "No FAQ data available."
@@ -4094,7 +4127,19 @@ GUIDELINES:
 FAQ Knowledge Base:
 {faq_context}"""
 
-    reply = phi4_complete(req.message, system=system_prompt)
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        reply = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: phi4_complete(req.message, system=system_prompt)),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        reply = "I'm taking too long to respond. Try again."
+    except Exception as e:
+        print(f"[chatbot] Phi-4 error: {e}")
+        reply = "I don't have specific information on that. Please contact our support team for further assistance."
+
     return {"reply": reply, "source": "ai"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
